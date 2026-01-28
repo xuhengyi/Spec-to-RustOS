@@ -1,0 +1,33 @@
+// RISC-V syscall numbers
+// Based on Linux RISC-V syscall numbering
+
+#define __NR_READ 63
+#define __NR_WRITE 64
+#define __NR_OPEN 56
+#define __NR_CLOSE 57
+#define __NR_EXIT 93
+#define __NR_EXIT_GROUP 94
+#define __NR_FORK 220
+#define __NR_EXECVE 221
+#define __NR_WAIT4 260
+#define __NR_WAITID 281
+#define __NR_GETPID 172
+#define __NR_GETTID 178
+#define __NR_KILL 129
+#define __NR_SIGACTION 134
+#define __NR_SIGPROCMASK 135
+#define __NR_RT_SIGRETURN 139
+#define __NR_SCHED_YIELD 124
+#define __NR_CLOCK_GETTIME 113
+#define __NR_CLONE 220
+#define __NR_SEMOP 65
+#define __NR_SEMGET 66
+#define __NR_SEMCTL 67
+#define __NR_MUTEX_CREATE 400
+#define __NR_MUTEX_LOCK 401
+#define __NR_MUTEX_UNLOCK 402
+#define __NR_CONDVAR_CREATE 403
+#define __NR_CONDVAR_SIGNAL 404
+#define __NR_CONDVAR_WAIT 405
+#define __NR_THREAD_CREATE 406
+#define __NR_WAITTID 407

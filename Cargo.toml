@@ -1,0 +1,28 @@
+[workspace]
+members = [
+    "xtask",
+    "ch1",
+    "ch1-lab",
+    "ch2",
+    "ch3",
+    "ch4",
+    "ch5",
+    "ch6",
+    "ch7",
+    "ch8",
+    "user",
+    "linker",
+    "console",
+    "syscall",
+    "kernel-context",
+    "kernel-alloc",
+    "kernel-vm",
+    "task-manage",
+    "easy-fs",
+    "signal-defs",
+    "signal",
+    "signal-impl",
+    "sync",
+]
+default-members = ["xtask"]
+resolver = "2"

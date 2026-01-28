@@ -1,0 +1,17 @@
+**/.*/*
+!**/.cargo/*
+!/.github/*
+!/.vscode/settings.json
+
+/target
+*.asm
+*.bin
+!/rustsbi-qemu.bin
+
+# 文档
+STEP_BY_STEP.md
+
+# 日志文件
+*.log
+/tmp/
+implementation_logs/*.log
