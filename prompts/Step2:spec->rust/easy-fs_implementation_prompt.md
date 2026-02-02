@@ -1,3 +1,5 @@
+>已弃用，见`prompts/Step2:spec->rust/easy-fs`
+
 # 实现生成 Prompt: easy-fs
 
 ## 角色
