@@ -364,23 +364,46 @@ pub mod foreign {
     use super::LocalContext;
     
     /// Portal cache record expected to be mapped in a shared ("public") address space.
+    ///
+    /// Layout (8-byte aligned):
+    /// 0:  a0
+    /// 8:  a1
+    /// 16: satp
+    /// 24: sstatus
+    /// 32: sepc
+    /// 40: stvec (saved)
+    /// 48: sscratch (saved)
     #[repr(C)]
     pub struct PortalCache {
-        pub satp: usize,
-        pub sepc: usize,
         pub a0: usize,
+        pub a1: usize,
+        pub satp: usize,
         pub sstatus: usize,
+        pub sepc: usize,
+        pub stvec: usize,
+        pub sscratch: usize,
     }
 
     impl PortalCache {
-        pub fn init(&mut self, satp: usize, pc: usize, a0: usize, supervisor: bool, interrupt: bool) {
+        pub fn init(
+            &mut self,
+            satp: usize,
+            pc: usize,
+            a0: usize,
+            a1: usize,
+            supervisor: bool,
+            interrupt: bool,
+        ) {
             self.satp = satp;
             self.sepc = pc;
             self.a0 = a0;
+            self.a1 = a1;
             let mut sstatus = 0usize;
             if supervisor { sstatus |= 1 << 8; }
             if interrupt { sstatus |= 1 << 5; }
             self.sstatus = sstatus;
+            self.stvec = 0;
+            self.sscratch = 0;
         }
 
         pub fn address(&self) -> usize {
@@ -395,18 +418,31 @@ pub mod foreign {
 
     impl ForeignContext {
         #[cfg(target_arch = "riscv64")]
-        pub unsafe fn execute<P: ForeignPortal, K: SlotKey>(&mut self, portal: &mut P, key: K) -> usize {
+        pub unsafe fn execute<P: ForeignPortal, K: SlotKey>(
+            &mut self,
+            portal: &mut P,
+            key: K,
+        ) -> usize {
             let orig_supervisor = self.context.supervisor;
             let orig_interrupt = self.context.interrupt;
-            self.context.supervisor = true;
-            self.context.interrupt = false;
             let entry = portal.transit_entry();
             let cache = portal.transit_cache(key);
-            cache.init(self.satp, self.context.pc(), self.context.a(0), orig_supervisor, orig_interrupt);
+            cache.init(
+                self.satp,
+                self.context.pc(),
+                self.context.a(0),
+                self.context.a(1),
+                orig_supervisor,
+                orig_interrupt,
+            );
+            *self.context.pc_mut() = entry;
+            *self.context.a_mut(0) = cache.address();
+            self.context.supervisor = true;
+            self.context.interrupt = false;
+            let ret = self.context.execute();
             self.context.supervisor = orig_supervisor;
             self.context.interrupt = orig_interrupt;
-            *self.context.a_mut(0) = cache.a0;
-            cache.sstatus
+            ret
         }
 
         #[cfg(not(target_arch = "riscv64"))]

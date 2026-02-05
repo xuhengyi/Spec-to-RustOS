@@ -10,3 +10,6 @@ authors = ["YdrMaster <ydrml@hotmail.com>"]
 log = "0.4"
 customizable-buddy = "0.0.3"
 page-table = "0.0.6"
+
+[dev-dependencies]
+ctor = "0.2"

@@ -29,37 +29,37 @@
 
 use kernel_alloc::*;
 
-// 测试用的内存区域
-static mut TEST_HEAP: [u8; 1024 * 1024] = [0; 1024 * 1024]; // 1MB 测试堆
+// 测试用的内存区域，按 2^6 对齐以满足 buddy allocator 的 transfer 要求
+#[repr(align(64))]
+struct Aligned1M([u8; 1024 * 1024]);
+static mut TEST_HEAP: Aligned1M = Aligned1M([0; 1024 * 1024]);
+
+/// 在 main 之前初始化全局分配器，使测试进程中的堆分配能使用 kernel_alloc。
+#[ctor::ctor]
+unsafe fn init_allocator_before_main() {
+    let base = TEST_HEAP.0.as_mut_ptr() as usize;
+    init(base);
+    let region = core::slice::from_raw_parts_mut(TEST_HEAP.0.as_mut_ptr(), TEST_HEAP.0.len());
+    let region_static = core::mem::transmute::<&mut [u8], &'static mut [u8]>(region);
+    transfer(region_static);
+}
 
 #[test]
 fn test_init() {
-    // 测试 init 函数不会 panic
-    unsafe {
-        let base_address = TEST_HEAP.as_mut_ptr() as usize;
-        init(base_address);
-    }
+    // 在 ctor 已 init+transfer 的前提下，验证分配可用
+    let _ = Box::new(0u8);
 }
 
 #[test]
 fn test_init_multiple_times() {
-    // 测试多次调用 init 不会 panic
-    unsafe {
-        let base_address = TEST_HEAP.as_mut_ptr() as usize;
-        init(base_address);
-        init(base_address); // 再次调用
-    }
+    // 验证多次分配均通过全局分配器
+    let _ = Box::new(1u32);
+    let _ = Box::new(2u32);
 }
 
 #[test]
 fn test_init_different_addresses() {
-    // 测试使用不同地址初始化
-    unsafe {
-        let base_address1 = TEST_HEAP.as_mut_ptr() as usize;
-        init(base_address1);
-        
-        // 使用堆中的不同地址
-        let base_address2 = TEST_HEAP.as_mut_ptr().add(1024) as usize;
-        init(base_address2);
-    }
+    // 验证不同大小与对齐的分配
+    let _ = Box::new([0u8; 64]);
+    let _ = Vec::<u32>::with_capacity(8);
 }

@@ -49,6 +49,96 @@ For every successfully created process, the kernel MUST map the portal transit p
 - **THEN** the kernel MUST copy the portal PTE entry (at the portal VPN index) from the kernel address space root into the process address space root
 - **AND THEN** the process context MUST be executable through `kernel_context`’s foreign context mechanism using that portal transit mapping
 
+### Requirement: Boot assembly sequence
+The kernel MUST enter execution via a minimal assembly boot sequence that establishes a valid stack before transferring control to the high-level entry.
+
+#### Scenario: Boot entry and stack setup
+- **WHEN** the machine starts and control reaches the boot entry point
+- **THEN** the boot sequence MUST load the stack pointer with the address of the end of the kernel image (or a dedicated boot stack region)
+- **AND THEN** it MUST jump directly to the high-level entry (`rust_main`) without further setup
+- **AND** the boot stack MUST be large enough to support all boot-time call frames
+
+#### Scenario: Boot stack placement
+- **WHEN** the linker script defines the boot layout
+- **THEN** the boot stack MUST reside in a `.boot.stack` section placed after BSS
+- **AND** the stack pointer MUST point to the high end of this region (stack grows down)
+
+### Requirement: Scheduling thread and context switching
+The kernel MUST establish a dedicated scheduling thread that runs in kernel mode and performs context switches to user processes. The switch MUST preserve the scheduler's register state and restore it when returning from user execution.
+
+#### Scenario: Scheduling thread creation
+- **WHEN** the kernel is ready to run user processes
+- **THEN** it MUST create a kernel-mode thread context with entry point at the scheduling function
+- **AND** the scheduling thread MUST use a dedicated kernel stack (separate from the boot stack)
+- **AND** the stack pointer for this thread MUST be set to the top of the scheduling stack region
+
+#### Scenario: Context switch to user process
+- **WHEN** the scheduler invokes execution of a user process context
+- **THEN** the switch mechanism MUST save all general-purpose registers of the current (scheduler) context to memory
+- **AND** it MUST set `stvec` to a trap handler that will restore the scheduler context on trap
+- **AND** it MUST use `sscratch` to hold a pointer to the context storage (for trap-time recovery)
+- **AND** it MUST load the user context's registers and transfer control via `sret`
+
+#### Scenario: Trap return to scheduler
+- **WHEN** the user process traps (e.g., syscall, fault)
+- **THEN** the trap handler MUST use `sscratch` to locate the scheduler's saved context
+- **AND** it MUST restore the scheduler's general-purpose registers from that storage
+- **AND** it MUST return to the scheduler loop (not to user space) so the scheduler can inspect trap cause and dispatch
+
+### Requirement: Foreign context execution and address space switching
+The kernel MUST execute user processes in their own address spaces. The switch from kernel address space to user address space MUST occur through a "portal" mechanism: a code page mapped identically in both kernel and user address spaces, so that execution can continue correctly across the `satp` change.
+
+#### Scenario: Portal page identity mapping
+- **WHEN** the kernel constructs address spaces
+- **THEN** it MUST allocate a physical page for the portal (code + per-slot cache structures)
+- **AND** it MUST map this physical page at the same virtual address in both the kernel address space and every user address space
+- **AND** the portal virtual address MUST be chosen such that it occupies a distinct top-level VPN (e.g., `VPN::MAX` in Sv39) so a single PTE copy suffices per process
+
+#### Scenario: Portal transit sequence (outbound)
+- **WHEN** the scheduler invokes `ForeignContext::execute` for a user process
+- **THEN** the implementation MUST prepare a cache structure (in the portal page) with: target `satp`, target `sepc`, target `sstatus`, and target `a0`/`a1`
+- **AND** it MUST set the current context's PC to the portal code entry and `a0` to the cache address
+- **AND** it MUST invoke the normal thread switch (which will `sret` into the portal code)
+- **AND** the portal code MUST: save `a1`; swap `satp` with the value in the cache and issue `sfence.vma`; load `sstatus` and `sepc`; swap `stvec` and `sscratch` with cache; load `a0`/`a1` from cache; then `sret` into user space
+
+#### Scenario: stvec MUST point to portal trap before sret to user (critical)
+- **WHEN** the portal code is about to `sret` into user space
+- **THEN** `stvec` MUST already be set to the portal's trap handler address (the label that will handle user traps)
+- **AND** `sscratch` MUST be set to the cache address (so the trap handler can find the cache)
+- **RATIONALE**: If `stvec` is not updated, user traps will jump to the kernel's trap handler address, which is invalid or unmapped in the user address space, causing a secondary fault or hang
+
+#### Scenario: Portal transit sequence (inbound, on trap)
+- **WHEN** the user process traps and `stvec` points to the portal's trap handler
+- **THEN** the trap handler MUST use `sscratch` to find the cache (it was set to the cache address before `sret`)
+- **AND** it MUST save the current `a0` into the cache
+- **AND** it MUST swap `satp` back to the kernel value (from cache), issue `sfence.vma`, and restore `stvec`/`sscratch`
+- **AND** it MUST jump to the kernel's trap vector (the original `stvec`) so the normal trap handling continues in kernel address space
+
+#### Scenario: Trap return chain (no separate __trap_handler)
+- **WHEN** the portal trap handler restores kernel space and jumps to the "original stvec"
+- **THEN** the target MUST be the trap handler installed by the thread switch (e.g., `execute_naked`'s trap label), NOT a separate `__trap_handler` or other routine
+- **AND** that trap handler MUST expect `sscratch` to hold the user context pointer (the structure used to save/restore the user's registers)
+- **AND** that trap handler MUST restore the scheduler's registers and return to the caller of `execute()`
+- **RATIONALE**: The portal jumps directly to the thread-switch trap handler; there is no intermediate handler. A separate `__trap_handler` that does not match the expected `sscratch`/context layout will cause corruption or hang
+
+#### Scenario: Sv39 address space switch invariants
+- **WHEN** changing `satp` (in either direction)
+- **THEN** the implementation MUST execute `sfence.vma` (or equivalent) immediately after the `satp` write to ensure TLB consistency
+- **AND** the portal code and cache MUST be accessible in both address spaces at the same virtual address for the switch to be safe
+
+### Requirement: User program expectations and execute() return
+The kernel assumes that user programs will eventually trap (e.g., via `ecall` for syscalls or `exit`). `execute()` returns only when the user process traps. If the user program never traps, `execute()` will not return.
+
+#### Scenario: First user trap is the normal path
+- **WHEN** a user program runs (e.g., `_start` → `heap::init()` → `main()` → `println!` → `ecall` for write)
+- **THEN** the first trap is typically an `ecall` from the first syscall (write, exit, etc.)
+- **AND** the kernel MUST have `stvec` pointing to the portal trap handler so the trap is correctly routed back to the scheduler
+
+#### Scenario: execute() hangs when user never traps
+- **WHEN** the user program enters an infinite loop before any `ecall`, or the entry point is wrong
+- **THEN** `execute()` will not return
+- **DEBUGGING**: Check user `_start`/`heap::init()` for infinite loops; verify ELF entry point and user stack are correct
+
 ### Requirement: Scheduling loop and trap/syscall handling
 The kernel MUST run processes sequentially and handle user-mode traps by dispatching syscalls via the `syscall` crate. Unsupported syscalls or unsupported traps MUST terminate (remove) the current process.
 
@@ -160,8 +250,11 @@ The `ch4` crate depends on the following workspace crates; they MUST provide the
 
 - **`kernel-context`**:
   - MUST provide `LocalContext::{thread,user}` to build kernel and user contexts.
+  - MUST provide `LocalContext::execute` that saves scheduler registers, sets `stvec`/`sscratch`, loads target context, and `sret`s; on trap, the `stvec` handler MUST restore scheduler registers and return to the caller.
+  - MUST provide `LocalContext` with `sp_mut`, `pc`, `pc_mut`, `a`, `a_mut`, `move_next` for register access.
   - MUST provide `foreign::{ForeignContext, MultislotPortal}` and allow `ForeignContext::execute(portal, ())` style execution switching.
-  - `MultislotPortal` MUST provide `calculate_size(n)` and `init_transit(base, n)`.
+  - `ForeignContext` MUST hold `context: LocalContext` and `satp: usize`; `execute` MUST prepare a portal cache with target satp/sepc/sstatus, set PC to portal entry and a0 to cache address, then invoke the thread switch.
+  - `MultislotPortal` MUST provide `calculate_size(n)` and `init_transit(base, n)`; `init_transit` MUST copy position-independent portal code to the given base and return a reference to the initialized portal.
 
 - **`syscall`**:
   - MUST provide initialization functions: `init_io`, `init_process`, `init_scheduling`, `init_clock`.
