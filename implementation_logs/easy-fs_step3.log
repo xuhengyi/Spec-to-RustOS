@@ -1,0 +1,56 @@
+# easy-fs Step 3: disk-layout 实现日志
+
+## 实现开始时间
+2026-01-26 开始
+
+## 使用的资源
+✅ 当前模块的 spec: openspec/specs/disk-layout/spec.md, design.md
+- 未使用直接依赖的 spec（block-device 和 block-cache 的接口从已生成代码的 pub API 即可了解）
+- 已查看的已生成代码仅限于了解模块接口：lib.rs, block_cache.rs, block_dev.rs
+
+## 实现过程
+
+### 1. 分析 Spec 需求
+从 spec.md 和 design.md 中了解到：
+- 块大小 512 字节
+- 磁盘分为 5 个连续区域：SuperBlock、Inode Bitmap、Inode Area、Data Bitmap、Data Area
+- SuperBlock: magic = 0x3b800001，#[repr(C)]
+- Bitmap: 每块 4096 bits（512 * 8），alloc/dealloc 操作
+- DiskInode: 128 字节，#[repr(C)]，包含 direct[28]、indirect1、indirect2
+- DirEntry: 32 字节，#[repr(C)]，name[28] + inode_number
+
+### 2. 关键设计决策
+- DIRECT_BOUND = 28（直接索引边界）
+- INDIRECT1_BOUND = 28 + 128 = 156（一级间接索引边界）
+- 每块可存储 128 个 u32（512 / 4）
+- 每块容纳 4 个 DiskInode（512 / 128）
+- 每块 4096 个 bit（512 * 8）
+
+### 3. 实现内容
+创建 layout.rs 文件，实现：
+- 常量：EFS_MAGIC, INODE_DIRECT_COUNT, NAME_LENGTH_LIMIT, DIRENT_SZ
+- 内部常量：INODE_INDIRECT1_COUNT, DIRECT_BOUND, INDIRECT1_BOUND, BLOCK_BITS
+- SuperBlock 结构：magic, total_blocks, inode_bitmap_blocks, inode_area_blocks, data_bitmap_blocks, data_area_blocks
+- SuperBlock 方法：initialize, is_valid
+- Bitmap 结构：start_block_id, blocks
+- Bitmap 方法：new, alloc, dealloc, maximum
+- DiskInodeType 枚举：File, Directory
+- DiskInode 结构：size, direct[28], indirect1, indirect2, type_
+- DiskInode 方法：initialize, is_dir, is_file, data_blocks, total_blocks, blocks_num_needed, get_block_id, increase_size, clear_size, read_at, write_at
+- DirEntry 结构：name[28], inode_number
+- DirEntry 方法：empty, new, as_bytes, as_bytes_mut, name, inode_number
+- 类型别名：BitmapBlock, IndirectBlock, DataBlock
+
+### 4. 更新 lib.rs
+- 添加 mod layout
+- 导出所有 public API
+
+## 测试结果
+✅ cargo check 通过
+✅ 一次生成即通过测试（第一次运行 cargo check 命令直接编译成功，无报错信息）
+
+## 实现完成时间
+2026-01-26 完成
+
+## 备注
+实现严格按照 spec 要求，所有 public API 和常量都已实现。使用 #[repr(C)] 确保内存布局稳定。

@@ -1,0 +1,127 @@
+# easy-fs 实现日志
+
+## 实现开始时间
+2026-01-24
+
+## 使用的资源
+
+### ✅ 当前 crate 的 spec
+- `openspec/specs/easy-fs/spec.md`: 阅读了完整的 spec，了解了所有对外契约和边界
+- `openspec/specs/easy-fs/design.md`: 阅读了设计文档，了解了磁盘布局和实现约束
+
+### ⚠️ 直接依赖的 spec
+- 无直接依赖
+
+### ❌ 已生成的代码
+- 未访问已生成的代码（遵循规范，仅基于 spec 实现）
+
+## 实现过程（第一轮）
+
+### 1. 基础类型和常量实现
+- 实现了 `BLOCK_SZ` 常量（512 字节）
+- 实现了 `BlockDevice` trait（`read_block`/`write_block`）
+- 使用 `bitflags` 实现了 `OpenFlags`（RDONLY/WRONLY/RDWR/CREATE/TRUNC）
+- 定义了 `FSManager` trait（仅定义，不实现）
+
+### 2. 磁盘布局结构实现
+- 实现了 `SuperBlock` 结构（包含 magic、各区域大小）
+- 实现了 `DiskInode` 结构（size、type、direct/indirect1/indirect2 索引）
+- 实现了 `DiskInodeType` 枚举（File/Directory）
+- 实现了 `DirEntry` 结构（32 字节，包含文件名和 inode 编号）
+
+### 3. 块缓存系统实现
+- 实现了 `BlockCache` 结构（缓存块数据、block_id、modified 标志）
+- 实现了 `BlockCacheManager` 结构（管理 16 个缓存条目）
+- 实现了缓存替换策略（基于 `Arc::strong_count == 1`）
+- 实现了 `get_block_cache` 和 `sync_all` 函数
+
+### 4. EasyFileSystem 实现
+- 实现了 `create` 方法：创建新文件系统，清零所有块，写入 superblock，分配根目录 inode
+- 实现了 `open` 方法：打开已存在的文件系统，校验 superblock
+- 实现了 `root_inode` 方法：获取根 inode
+- 实现了 `alloc_inode` 方法：分配新的 inode
+- 实现了 `alloc_data_block` 方法：分配新的数据块
+- 实现了 `dealloc_data_block` 方法：释放数据块
+- 实现了 `get_disk_inode` 方法：获取磁盘 inode 的块缓存
+
+### 5. Inode 实现
+- 实现了 `find` 方法：在当前目录下查找文件
+- 实现了 `create` 方法：在当前目录下创建文件
+- 实现了 `readdir` 方法：枚举目录
+- 实现了 `read_at` 方法：按偏移读取文件
+- 实现了 `write_at` 方法：按偏移写入文件（支持扩容）
+- 实现了 `clear` 方法：清空文件并回收数据块
+- 实现了 `get_block_id` 方法：获取指定偏移对应的块 ID（支持 direct/indirect1/indirect2）
+- 实现了 `get_block_id_if_exists` 方法：获取指定偏移对应的块 ID（如果存在，用于读取）
+- 实现了 `increase_size` 方法：增加文件大小并分配所需的数据块
+
+### 6. FileHandle 和 UserBuffer 实现
+- 实现了 `UserBuffer` 结构（由多个 `&'static mut [u8]` 组成）
+- 实现了 `FileHandle` 结构（缓存 inode、读写权限、偏移）
+- 实现了 `FileHandle::new` 和 `FileHandle::empty` 方法
+- 实现了 `FileHandle::read` 方法：从 inode 读取数据到 UserBuffer
+- 实现了 `FileHandle::write` 方法：从 UserBuffer 写入数据到 inode
+
+## 实现过程（第二轮 - 调试）
+
+### 关键 Bug 修复
+
+1. **死锁问题（get_block_cache）**
+   - 问题：在查找已缓存的块时，持有锁的同时返回 `Arc` 引用，导致调用者获取锁时死锁
+   - 修复：先释放锁，然后再返回引用
+
+2. **逻辑块号到物理块 ID 的转换**
+   - 问题：`alloc_data_block` 返回逻辑块号，但在读写时需要转换为物理块 ID
+   - 修复：在所有数据块访问处调用 `get_data_block_id` 进行转换
+
+3. **间接块访问时的物理块 ID 转换**
+   - 问题：访问一级/二级间接块时也需要将逻辑块号转换为物理块 ID
+   - 修复：在 `get_block_id` 和 `get_block_id_if_exists` 中对间接块进行转换
+
+4. **inode 偏移量问题**
+   - 问题：`get_disk_inode` 只返回块缓存，但未使用 inode 在块内的偏移量
+   - 修复：修改 `get_disk_inode` 返回 `(Arc<Mutex<BlockCache>>, usize)` 元组，并在所有调用处使用正确的偏移量
+
+5. **create 方法中的死锁**
+   - 问题：在持有 `disk_inode` 锁的同时调用 `get_block_id`，后者也需要获取该锁
+   - 修复：先释放锁，调用 `get_block_id`，然后再获取锁进行操作
+
+6. **块缓存未清除问题**
+   - 问题：测试共享全局 `BLOCK_CACHE_MANAGER`，导致旧数据干扰新测试
+   - 修复：在 `EasyFileSystem::create` 和 `open` 中调用 `clear_block_cache`
+
+7. **alloc_data_block 返回 0 的问题**
+   - 问题：块 ID 0 被用作"未分配"的标记，但 `alloc_data_block` 可能返回 0
+   - 修复：在 `alloc_data_block` 中跳过块 ID 0，确保始终返回非零值
+
+## 测试结果（当前）
+
+### 编译状态
+- ✅ `cargo check` 通过
+
+### 测试状态（27 个测试）
+- ✅ 20 个测试通过
+- ❌ 7 个测试失败
+
+### 失败的测试
+1. `test_easy_filesystem_open` - 重新打开文件系统后 find 失败
+2. `test_inode_create_file` - 创建文件后 find 失败
+3. `test_inode_create_multiple_files` - 创建多个文件后查找失败
+4. `test_inode_read_at_eof_returns_zero` - 读取边界问题
+5. `test_inode_read_write_large` - 大文件读写问题
+6. `test_inode_readdir` - 目录枚举失败
+7. `test_inode_size` - 文件大小计算问题
+
+### 问题分析
+失败的测试主要涉及目录操作（create、find、readdir）。可能的原因：
+1. `create` 方法中 `get_block_id` 更新 `inode.direct[0]` 后，该更新没有正确同步到后续的 `find` 操作
+2. 块缓存的同步机制可能存在问题
+3. 需要进一步调查 `inode.direct[0]` 更新后是否被正确保存
+
+## 待解决问题
+1. 继续调查目录操作失败的原因
+2. 检查块缓存同步机制
+3. 验证 `create` 方法中的数据一致性
+
+## 实现更新时间
+2026-01-24（调试进行中）

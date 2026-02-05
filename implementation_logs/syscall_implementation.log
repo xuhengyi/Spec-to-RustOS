@@ -1,0 +1,156 @@
+# syscall 实现日志
+
+## 实现开始时间
+2026-01-24
+
+## 使用的资源
+
+### ✅ 当前 crate 的 spec
+- `openspec/specs/syscall/spec.md`: 完整阅读并理解了所有需求
+- `openspec/specs/syscall/design.md`: 阅读了设计文档，理解了架构决策
+
+### ⚠️ 直接依赖的 spec
+- `openspec/specs/signal-defs/spec.md`: 阅读了 signal-defs 的 spec，以了解 SignalAction、SignalNo 和 MAX_SIG 的定义
+  - **原因**: 需要 re-export signal-defs 的类型，需要了解这些类型的结构和行为
+
+### ❌ 已生成的代码
+- 未访问已生成的代码
+
+## 实现过程
+
+### 1. 阅读 spec 和理解需求
+- 阅读了 `openspec/specs/syscall/spec.md` 和 `design.md`，理解了所有需求：
+  - crate 必须是 `#![no_std]`
+  - `kernel` 和 `user` features 不能同时启用
+  - 需要提供基础类型：`SyscallId`、`ClockId`、`TimeSpec`
+  - 需要提供常量：`STDIN`、`STDOUT`、`STDDEBUG`、`ClockId::CLOCK_*`、`TimeSpec::ZERO/SECOND/等`
+  - `user` feature 需要提供 RISC-V `ecall` 原语和 syscall wrappers
+  - `kernel` feature 需要提供 handler traits、init_* 函数和 handle 分发器
+  - 需要通过 `build.rs` 从 `syscall.h.in` 生成 `syscalls.rs`
+
+### 2. 创建 syscall.h.in 文件
+- 根据测试文件中使用的 syscall 号，创建了 `src/syscall.h.in` 文件
+- 定义了所有需要的 syscall 号：
+  - READ = 63, WRITE = 64, OPEN = 56, CLOSE = 57
+  - EXIT = 93, FORK = 220, EXECVE = 221, WAIT4 = 260
+  - GETPID = 172, GETTID = 178
+  - KILL = 129, SIGACTION = 134, SIGPROCMASK = 135, RT_SIGRETURN = 139
+  - SCHED_YIELD = 124, CLOCK_GETTIME = 113
+  - 同步原语相关的 syscall（MUTEX_*, CONDVAR_*, SEMOP 等）
+
+### 3. 创建 build.rs
+- 实现了 `build.rs` 脚本，从 `syscall.h.in` 解析 `#define __NR_*` 定义
+- 生成 `src/syscalls.rs`，包含 `impl SyscallId { pub const ... }` 关联常量
+- 设置了 `rerun-if-changed` 为 `build.rs` 和 `src/syscall.h.in`
+
+### 4. 实现 lib.rs 基础部分
+- 添加了 `#![no_std]` 和 feature 互斥检查
+- 实现了 `SyscallId` 类型（`#[repr(transparent)]`）和 `From<usize>` trait
+- 实现了 `ClockId` 类型和时钟常量（`CLOCK_REALTIME`、`CLOCK_MONOTONIC` 等）
+- 实现了 `TimeSpec` 结构体（`#[repr(C)]`）：
+  - 实现了 `Add` trait，处理纳秒溢出进位
+  - 实现了 `Display` trait
+  - 实现了 `PartialOrd` 和 `Ord` traits
+  - 提供了常量：`ZERO`、`SECOND`、`MILLSECOND`、`MICROSECOND`、`NANOSECOND`
+  - 实现了 `from_millsecond` 方法
+- 定义了标准文件描述符常量：`STDIN`、`STDOUT`、`STDDEBUG`
+- Re-export 了 `signal-defs` 的类型：`SignalAction`、`SignalNo`、`MAX_SIG`
+
+### 5. 实现 user.rs 模块
+- 使用 `bitflags!` 宏定义了 `OpenFlags`（移除了手动 derive，因为 bitflags 宏已自动实现）
+- 实现了 `native` 模块，包含 `syscall0` 到 `syscall6` 函数：
+  - 使用 `#[cfg(target_arch = "riscv64")]` 条件编译，只在 RISC-V 架构上使用汇编代码
+  - 在非 RISC-V 架构上（如测试环境）返回 -1
+  - 使用 RISC-V 寄存器约定：`a0-a5` 传参，`a7` 传 syscall id，`a0` 返回
+- 实现了所有 syscall wrapper 函数：
+  - IO: `read`、`write`、`open`、`close`
+  - 进程: `exit`、`fork`、`exec`、`wait`、`waitpid`、`getpid`
+  - 调度: `sched_yield`
+  - 时钟: `clock_gettime`
+  - 信号: `kill`、`sigaction`、`sigprocmask`、`sigreturn`
+  - 线程: `thread_create`、`gettid`、`waittid`
+  - 同步原语: `semaphore_create/up/down`、`mutex_create/lock/unlock`、`condvar_create/signal/wait`
+- `wait` 和 `waitpid` 实现了忙等让出逻辑（返回 -2 时调用 `sched_yield()` 并重试）
+
+### 6. 实现 kernel.rs 模块
+- 定义了 `Caller` 结构体（包含 `entity` 和 `flow` 字段）
+- 定义了 `SyscallResult` 枚举（`Done(isize)` 和 `Unsupported(SyscallId)`）
+- 定义了所有 handler traits：
+  - `Process`: fork、exec、exit、wait、waitpid、getpid
+  - `IO`: read、write、open、close
+  - `Memory`: mmap、munmap
+  - `Scheduling`: sched_yield
+  - `Clock`: clock_gettime
+  - `Signal`: kill、sigaction、sigprocmask、sigreturn
+  - `Thread`: thread_create、gettid、waittid
+  - `SyncMutex`: semaphore/mutex/condvar 相关操作
+- 使用 `spin::Once` 存储每个子系统的 handler（一次性初始化）
+- 实现了所有 `init_*` 函数
+- 实现了 `handle` 函数，根据 syscall id 分发到相应的 handler：
+  - 如果 handler 未初始化，返回 `SyscallResult::Unsupported(id)`
+  - 如果 handler 已初始化，调用相应的 trait 方法并返回 `SyscallResult::Done(ret)`
+
+### 7. 遇到的问题和解决
+
+#### 问题 1: 汇编代码在测试环境中无法编译
+- **错误**: `invalid register 'a7': unknown register`
+- **原因**: 测试环境不是 RISC-V 架构，无法识别 RISC-V 寄存器名称
+- **解决**: 使用 `#[cfg(target_arch = "riscv64")]` 条件编译，在非 RISC-V 架构上提供模拟实现（返回 -1）
+
+#### 问题 2: OpenFlags 的 trait 冲突
+- **错误**: `conflicting implementations of trait Copy/PartialEq/Eq for type OpenFlags`
+- **原因**: `bitflags!` 宏已经自动实现了这些 traits，不应该再手动 derive
+- **解决**: 移除了 `#[derive(Debug, Clone, Copy, PartialEq, Eq)]`，只保留 `bitflags!` 宏自动生成的实现
+
+#### 问题 3: build.rs 中的未使用变量警告
+- **警告**: `unused variable: out_dir`
+- **解决**: 移除了未使用的 `out_dir` 变量
+
+### 8. 验证过程
+- 运行 `cargo check`：编译成功，无错误
+- 运行 `cargo test --features user`：所有 14 个测试通过
+  - `test_syscall_id_basic`: ✅
+  - `test_syscall_id_constants`: ✅
+  - `test_io_constants`: ✅
+  - `test_clock_id_constants`: ✅
+  - `test_time_spec_basic`: ✅
+  - `test_time_spec_from_millisecond`: ✅
+  - `test_time_spec_add`: ✅
+  - `test_time_spec_display`: ✅
+  - `test_time_spec_ordering`: ✅
+  - `test_signal_no_from`: ✅
+  - `test_signal_action_default`: ✅
+  - `test_max_sig`: ✅
+  - `test_open_flags`: ✅
+  - `test_user_api_exists`: ✅
+
+## 测试结果
+
+### Gate 验证
+- ✅ `cargo check`: 通过
+- ✅ `cargo test --features user`: 通过（14 个测试全部通过）
+
+### 代码生成
+- **是否一次生成就通过测试**: 否
+- **修改流程**:
+  1. 第一次生成后，遇到汇编代码在测试环境中无法编译的问题
+  2. 添加了条件编译支持，在非 RISC-V 架构上提供模拟实现
+  3. 修复了 OpenFlags 的 trait 冲突问题
+  4. 修复了 build.rs 中的未使用变量警告
+  5. 最终所有测试通过
+
+## 实现完成时间
+2026-01-24
+
+## 总结
+
+成功实现了 `syscall` crate，满足了 spec 中的所有要求：
+- ✅ 实现了基础类型和常量
+- ✅ 实现了 `user` feature（RISC-V ecall 原语和 syscall wrappers）
+- ✅ 实现了 `kernel` feature（handler traits 和分发器）
+- ✅ 实现了 build.rs 生成 syscall 号常量
+- ✅ 所有测试通过
+- ✅ 代码符合 `#![no_std]` 要求
+- ✅ feature 互斥检查正常工作
+
+实现过程中主要遇到的挑战是处理不同架构的兼容性问题，通过条件编译成功解决了这个问题。

@@ -1,0 +1,61 @@
+# ch4 实现日志
+
+## 实现开始时间
+2025-01-30
+
+## 使用的资源
+
+1. **✅ 当前 crate 的 spec**
+   - `openspec/specs/ch4/spec.md`：boot、kernel 地址空间、ELF 加载、portal 映射、调度与 trap、syscall 宿主、panic 行为
+   - `openspec/specs/ch4/design.md`：顺序调度、portal 分离、字符串权限、identity mapping、heap transfer
+
+2. **⚠️ 直接依赖的 spec**
+   - 未单独阅读其他 crate 的 spec，通过阅读 linker、kernel-context、kernel-vm、syscall、kernel-alloc、console 的源码确认 API
+
+3. **🔧 需要验证的 crate 代码（集成测试阶段修改）**
+   - **kernel-vm**：
+     - 问题：`map_extern` 在遇到无效 PTE 时调用 `block()` 原实现为 `todo!()`，无法建立多级页表。
+     - 修改：`kernel-vm/src/lib.rs` 中 `MapExternDecorator::block()` 改为在无效 PTE 时通过 `manager.allocate(1, &mut flags)` 分配新页表页，构造 PTE 并返回 `Update::Pte(pte, self.manager.p_to_v(ppn))`，供 `page_table::walk_mut` 写入并继续遍历。
+     - 同时将 `MapExternDecorator` 的 `manager` 改为 `&'a mut M`，并在 `map_extern` 中先取 `root_ptr` 再创建 decorator，避免与 `root_ptr()` 的不可变借用冲突。
+
+4. **❌ 已生成的代码**
+   - 未参考其他章节已实现代码
+
+## 实现过程
+
+1. **build.rs**
+   - 与 ch3 一致：将 `linker::SCRIPT` 写入 `$OUT_DIR/linker.ld`，传递 `-T$OUT_DIR/linker.ld`，`rerun-if-changed` build.rs / LOG / APP_ASM。
+
+2. **main.rs 主流程**
+   - boot：`KernelLayout::locate().zero_bss()` → `init_console`(SbiConsole) → `set_log_level(option_env!("LOG"))` → `test_log()`。
+   - heap：`heap_size = (layout.start() + MEMORY).saturating_sub(layout.end())`，`assert!(heap_size > 0)`，`kernel_alloc::init(heap_start)`，`kernel_alloc::transfer(heap_region)`。MEMORY 取 64MB 以匹配 QEMU -m 64M，避免下溢。
+   - kernel 地址空间：实现 `Sv39Manager`（identity 映射、root 与堆页来自全局分配器，`check_owned` 为 root_ppn 或堆内 PPN），`kernel_space(layout, heap_ppn_start, heap_ppn_count, portal_ppn, portal_vpn)` 对 layout 各区域做 `map_extern`（Text→VRX, Rodata→VR, Data/Boot→VRW），再映射堆与 portal 页（VRWXU）。
+   - portal：`MultislotPortal::calculate_size(1)` 分配一页，`init_transit(portal_base, 1)`，portal 物理页映射到 kernel 与各进程的 PORTAL_VPN（0x1_0000）。
+   - ELF 加载：`AppMeta::locate().iter()` 遍历，用 xmas_elf 解析；仅接受 `type_().0 == ET_EXEC` 且 `machine` 为 RISC-V（transmute 读 Machine_）；对 PT_LOAD 做 `space.map`，权限按 segment flags 转为 VmFlags 字符串；用户栈 2 页在 TOP_OF_USER_STACK_VPN 下方；对每个进程 `map_extern` portal 页。
+   - 调度：`syscall::init_io/init_process/init_scheduling/init_clock`，写 kernel satp；循环：取 `processes[current]`，设 `CURRENT_SPACE`，构造 `ForeignContext`，`execute(portal, ())`，返回后清 `CURRENT_SPACE` 并 **恢复 kernel satp**；根据 scause 分支：UserEnvCall → syscall::handle，EXIT/Unsupported 则 remove 当前进程，否则写返回值并 `move_next()`；其他 trap 则 log 并 remove。进程列表空时 sbi shutdown。
+
+3. **SyscallHost**
+   - write(STDOUT/STDDEBUG)：用 `CURRENT_SPACE` 的 `translate(buf, "R")` 得到内核指针后按 count 打印 UTF-8。
+   - clock_gettime(CLOCK_MONOTONIC)：用 `CURRENT_SPACE` 的 `translate(tp, "W")` 写入 TimeSpec（time CSR 转 tv_sec/tv_nsec），返回 0。
+
+4. **修复与注意点**
+   - heap_size 下溢：改为 `saturating_sub` 并 `assert!(heap_size > 0)`，MEMORY 设为 64MB。
+   - trap 返回后必须恢复 kernel satp，否则后续内核代码在错误地址空间执行。
+   - xmas_elf：`Type_` 用 `.0`，`Machine_` 字段私有，用 `core::mem::transmute` 读 u16 与 EM_RISCV 比较。
+
+## 测试结果
+
+- **编译**：`cargo qemu --ch 4` 能完成构建（需由 xtask 设置 APP_ASM）。
+- **运行**：内核能完成 boot、test_log 输出（trace/debug/info/warn/error），随后在未打印 "Loaded N processes" 前挂起（可能处于 kernel_space 大量 map_extern 或首次 load_elf 中）。已做 satp 恢复与 heap_size 修复，后续需进一步定位挂点（如增加 log 或单进程测试）。
+
+## 集成测试结果（kernel-vm 修改）
+
+- 修改文件：`kernel-vm/src/lib.rs`
+- 修改内容：`MapExternDecorator::block()` 实现分配新页表页并返回 `Update::Pte`；decorator 持 `&mut M`；`map_extern` 先取 `root_ptr` 再建 decorator。
+- 修改原因：ch4 需在建立 kernel 地址空间时对多级页表进行创建，而原 `block()` 为 `todo!()`，无法继续遍历。
+
+## 实现完成时间
+2025-01-30
+
+## 日志语言
+中文

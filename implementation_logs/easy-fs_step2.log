@@ -1,0 +1,74 @@
+# easy-fs Step 2: block-cache 实现日志
+
+## 实现开始时间
+2026-01-26 开始实现
+
+## 使用的资源
+
+### ✅ 当前模块的 spec
+- `openspec/specs/block-cache/spec.md` - 主要规格说明
+- `openspec/specs/block-cache/design.md` - 设计决策
+
+### ⚠️ 直接依赖的 spec
+- 未使用（当前模块 spec 已足够清晰）
+
+### ❌ 已生成的代码
+- 阅读了 `easy-fs/src/lib.rs` 和 `easy-fs/src/block_dev.rs`（Step 1 代码）
+- 原因：需要了解已有的模块结构和导出的接口，以确保兼容性
+- 这是必要的，因为 prompt 明确要求使用 Step 1 已生成的代码
+
+## 实现过程
+
+### 1. 分析 spec 要求
+从 spec.md 提取的核心需求：
+- BlockCache 结构：包含 `[u8; 512]` 缓存、block_id、block_device 引用、modified 脏标记
+- 创建时读取块数据，modified 初始为 false
+- 类型安全访问：get_ref, get_mut, read, modify 方法
+- get_mut 设置 modified = true
+- sync() 方法：modified 为 true 时写回并重置标记
+- Drop 自动调用 sync()
+- BlockCacheManager：最多 16 个缓存，基于 strong_count 的替换策略
+- 全局函数：get_block_cache, block_cache_sync_all
+- 全局静态变量：BLOCK_CACHE_MANAGER
+
+### 2. 实现 block_cache.rs
+根据 spec 实现完整的 block-cache 模块。
+
+创建了 `easy-fs/src/block_cache.rs`，包含：
+- `BlockCache` 结构：包含 cache 数组、block_id、block_device、modified 字段
+- `BlockCache::new()`: 创建时从块设备读取数据
+- `get_ref<T>()`: 获取不可变引用
+- `get_mut<T>()`: 获取可变引用，设置 modified = true
+- `read<T, V>()`: 通过闭包读取数据
+- `modify<T, V>()`: 通过闭包修改数据
+- `sync()`: 同步脏块到块设备
+- `Drop` trait: 自动调用 sync()
+- `BlockCacheManager`: 管理最多 16 个缓存
+- `BlockCacheManager::get_block_cache()`: 获取或创建缓存，支持替换策略
+- `BLOCK_CACHE_MANAGER`: 全局静态变量
+- `get_block_cache()`: 全局便捷函数
+- `block_cache_sync_all()`: 同步所有脏块
+
+### 3. 更新 lib.rs
+- 添加 `extern crate alloc;` 以支持 Arc 和 VecDeque
+- 添加 `mod block_cache;`
+- 导出所有公开接口
+
+## 测试结果
+
+### Gate 验证
+`cargo check` 通过，无错误。
+
+### 一次生成通过
+✅ 是的，代码第一次运行 `cargo check` 就通过了，没有任何编译错误。
+
+## 实现完成时间
+2026-01-26 实现完成
+
+## 总结
+block-cache 模块根据 spec 完整实现，一次通过编译检查。主要功能包括：
+1. BlockCache 结构实现了块数据缓存和脏标记管理
+2. 提供类型安全的 get_ref/get_mut/read/modify 访问接口
+3. 实现 RAII 模式，Drop 时自动写回脏块
+4. BlockCacheManager 实现缓存管理，支持最多 16 个缓存和基于 strong_count 的替换策略
+5. 提供全局访问接口 get_block_cache 和 block_cache_sync_all

@@ -1,0 +1,57 @@
+# kernel-alloc 实现日志
+
+## 实现开始时间
+2025-01-30
+
+## 使用的资源
+
+1. **✅ 当前 crate 的 spec**
+   - `openspec/specs/kernel-alloc/spec.md`：全局分配器、init、transfer、handle_alloc_error、dealloc、并发约束等契约
+   - `openspec/specs/kernel-alloc/design.md`：BuddyAllocator<21, UsizeBuddy, LinkedListBuddy>、min_order=6、两阶段 init+transfer、无锁
+
+2. **⚠️ 直接依赖的 spec**
+   - 无（未访问其他 crate 的 spec）
+
+3. **❌ 已生成的代码**
+   - 测试失败后为定位 “attempt to subtract with overflow” 与 transfer 对齐要求，查阅了：
+     - `~/.cargo/registry/.../customizable-buddy-0.0.3/src/lib.rs`：init/transfer/deallocate 语义，以及 deallocate 中 `order - self.min_order` 要求 `order >= min_order`（即区域须按 2^min_order 对齐）
+     - `user/src/heap.rs`：仅确认 customizable_buddy 的用法（init + transfer），未照抄
+   - 原因：仅靠 spec 无法得知 transfer 区域必须按 2^min_order 对齐，否则 deallocate（transfer 内部调用）会因 order_ptr 过小导致 `order - min_order` 下溢。
+   - 学到的内容：base 与 transfer 的 region 起始地址须按 2^min_order（本实现为 64 字节）对齐；测试需用 `#[repr(align(64))]` 的缓冲区。
+
+## 实现过程
+
+1. **阅读 spec 与 design**
+   - 确认需提供：`#[global_allocator]`、`init(base_address)`、`unsafe transfer(region)`，分配失败时调用 `handle_alloc_error(layout)`，dealloc 委托给内部 buddy。
+
+2. **查 customizable-buddy API**
+   - 通过 docs.rs 与 web 搜索确认：`BuddyAllocator::new()`、`init(min_order, base)`、`transfer(ptr, size)`、`allocate_layout`、`deallocate_layout`、`handle_alloc_error` 在 `alloc::alloc`。
+
+3. **实现 lib.rs**
+   - 使用 `BuddyAllocator<21, UsizeBuddy, LinkedListBuddy>`，`UnsafeCell<Buddy>` 包装为 `BuddyCell` 并 `unsafe impl Sync`（由调用方保证无并发，符合 spec）。
+   - `init(base_address)`：`NonNull::new(base as *mut u8).unwrap()`，`min_order = 6`（与 design 容量估算一致）。
+   - `transfer(region)`：`NonNull::new(region.as_mut_ptr()).unwrap()`，调用 `BUDDY.transfer(ptr, region.len())`。
+   - `GlobalAlloc`：alloc 成功返回指针，失败调用 `handle_alloc_error(layout)`；dealloc 委托 `deallocate_layout`。
+
+4. **测试与修复**
+   - 首次 `cargo test`：单元测试二进制在未 init/transfer 前就发生分配，导致 “memory allocation of 4 bytes failed”。
+   - 处理方式：`cfg(test)` 时在 lib 中注册 `std::alloc::System` 作为全局分配器，单元测试二进制使用系统分配器；集成测试二进制使用本 crate 的 KernelAlloc，并在 `tests/api_tests.rs` 中用 `ctor::ctor` 在 main 前执行 init + transfer。
+   - 集成测试仍失败：“attempt to subtract with overflow” 于 customizable-buddy 的 deallocate（transfer 内部调用）。经查源码，`order = order_ptr.min(order_len)`，若 region 仅字节对齐则 `order_ptr == 0`，`order - min_order` 下溢。因此要求 base 与 transfer 区域按 2^6 对齐。
+   - 测试侧：使用 `#[repr(align(64))] struct Aligned1M([u8; 1024*1024])` 作为 TEST_HEAP，ctor 中对该缓冲区做 init + transfer。
+   - buddy 的 `init()` 在 `capacity != 0` 时断言失败（禁止在 transfer 后再 init），因此不能在单进程内先 ctor 再在测试里再次 init。将集成测试用例改为验证分配行为：test_init / test_init_multiple_times / test_init_different_addresses 分别用 Box/Vec 等验证分配可用，而非再次调用 init。
+
+5. **依赖与条件编译**
+   - 增加 `dev-dependencies`：`ctor = "0.2"`，仅用于集成测试的 ctor。
+   - `#![cfg_attr(not(test), no_std)]`，`cfg(test)` 时使用 std 与 System 全局分配器，非 test 时使用 KernelAlloc。
+
+## 测试结果
+
+- `cd kernel-alloc && cargo check`：通过，无错误。
+- `cd kernel-alloc && cargo test`：通过；单元测试 0 个（lib 内无 #[test]），集成测试 3 个（test_init, test_init_multiple_times, test_init_different_addresses）全部通过。
+- 非首次即过：经历 “分配失败”“transfer 后 init 断言”“transfer 对齐导致下溢” 等多次失败，通过查 spec、design、customizable-buddy 源码与测试改写后通过。
+
+## 实现完成时间
+2025-01-30
+
+## 日志语言
+中文

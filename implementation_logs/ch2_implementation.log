@@ -1,0 +1,172 @@
+# ch2 实现日志
+
+## 实现开始时间
+2026-01-24 约 11:30 (UTC+8)
+
+## 使用的资源
+
+### ✅ 当前 crate 的 spec
+- `openspec/specs/ch2/spec.md` - 主要实现规范
+- `openspec/specs/ch2/design.md` - 设计文档
+
+### ⚠️ 直接依赖的 spec（已使用，说明原因）
+1. `openspec/specs/linker/spec.md` - 需要了解 `boot0!` 宏、`KernelLayout`、`AppMeta` 的接口
+2. `openspec/specs/console/spec.md` - 需要了解 `Console` trait 和初始化函数
+3. `openspec/specs/kernel-context/spec.md` - 需要了解 `LocalContext` 的接口和执行语义
+4. `openspec/specs/syscall/spec.md` - 需要了解 syscall handler traits 和 `handle` 函数
+
+原因：ch2 spec 仅描述了内核的行为，但具体的 API 调用方式需要参考依赖 crate 的 spec。
+
+### 🔧 需要验证的 crate 代码（已访问和修改）
+
+#### kernel-context crate
+**发现的问题**：
+1. 原实现使用 `#[naked]` 和 `asm!` 宏，在新版 Rust 中需要改为 `#[unsafe(naked)]` 和 `naked_asm!`
+2. 寄存器映射不正确：代码中 x5/x6/x7 的偏移量与目标寄存器不匹配
+3. sstatus 设置不正确：应该设置 SPIE (bit 5) 而不是 SIE (bit 1) 来控制 sret 后的中断状态
+4. 内核栈指针保存/恢复机制不完善
+
+**修改的文件**：
+- `kernel-context/src/lib.rs`
+
+**修改原因和解决方案**：
+完全重写了 execute 函数和相关的汇编代码：
+1. 使用 `global_asm!` 定义 `__execute_context` 和 `__trap_handler` 函数
+2. 正确保存内核栈指针到 sscratch，在 trap handler 中恢复
+3. 正确映射所有 RISC-V 寄存器到 LocalContext 结构体偏移
+4. 使用 csrrw 指令原子交换 a0 和 sscratch 来安全保存/恢复上下文
+
+#### linker crate
+**发现的问题**：
+`AppIterator::next()` 中地址数组的读取位置不正确，使用了 `.add(1)` 跳过了 `first` 字段，但 `first` 字段本身就是地址数组的第一个元素。
+
+**修改的文件**：
+- `linker/src/lib.rs`
+
+**修改原因和解决方案**：
+移除了 `.add(1)` 调用，直接从 `first` 字段开始读取地址数组。
+
+#### user crate
+**发现的问题**：
+用户程序没有 `build.rs` 来处理 `BASE_ADDRESS` 环境变量并生成正确的链接脚本，导致用户程序没有被正确链接到指定的基地址（0x80400000）。
+
+**修改的文件**：
+- `user/build.rs`（新创建）
+
+**修改原因和解决方案**：
+创建 build.rs 来：
+1. 读取 `BASE_ADDRESS` 环境变量（默认 0x80400000）
+2. 生成包含正确入口点和段布局的链接脚本
+3. 确保 `.text.entry` 段在最前面
+
+### ❌ 已生成的代码（未使用）
+未访问任何已生成的代码。
+
+## 实现过程
+
+### 1. 初始实现
+创建了 `ch2/build.rs` 和 `ch2/src/main.rs`：
+- build.rs：生成 linker.ld 并传递链接参数
+- main.rs：实现批处理内核的核心逻辑
+
+### 2. 第一次编译错误
+kernel-context crate 编译失败：
+- `#[naked]` 需要 `#[unsafe(naked)]`
+- `asm!` 在 naked 函数中需要改为 `naked_asm!`
+- 参数不能使用 `in(reg)` 操作数
+
+修复：重写 naked 函数使用正确的语法。
+
+### 3. 第二次编译错误
+ch2 编译失败：
+- `#![feature(naked_functions)]` 不再需要
+- `syscall::IO` 和 `syscall::Process` trait 的方法签名不匹配
+- 缺少一些 trait 方法的实现
+
+修复：更新方法签名，添加缺失的方法实现。
+
+### 4. 运行时问题 - 程序卡住
+程序启动后卡在 "Running app 0"，没有任何输出。
+
+调试过程：
+1. 检查 sstatus 设置 - 发现应该设置 SPIE 而不是 SIE
+2. 检查寄存器映射 - 发现偏移量和目标寄存器不匹配
+3. 完全重写 kernel-context 的执行逻辑
+
+### 5. 运行时问题 - IllegalInstruction
+程序运行但所有应用都报 IllegalInstruction 或 LoadFault。
+
+调试过程：
+1. 检查用户程序二进制文件 - 发现开头是数据而不是代码
+2. 创建 `user/build.rs` 生成正确的链接脚本
+3. 重新构建后仍然报错
+
+### 6. 发现 linker crate bug
+检查 `linker::AppMeta::iter()` 的实现，发现地址数组读取位置错误。
+
+修复：移除 `.add(1)` 调用。
+
+### 7. 最终验证
+所有 5 个测试用例正确运行：
+- `00hello_world`: 输出 "Hello, world!" 并正常退出
+- `01store_fault`: 触发 StoreFault 被内核杀死
+- `02power`: 正确计算幂次并输出结果
+- `03priv_inst`: 触发 IllegalInstruction 被内核杀死
+- `04priv_csr`: 触发 IllegalInstruction 被内核杀死
+
+## 测试结果
+
+### Gate 验证
+✅ `cargo qemu --ch 2` 通过
+
+### 是否一次生成就通过测试
+❌ 否
+
+代码经过多次迭代修改才通过测试，主要问题出在：
+1. kernel-context crate 的实现问题（语法、寄存器映射、sstatus 设置）
+2. linker crate 的实现问题（地址数组偏移）
+3. user crate 缺少 build.rs
+
+## 集成测试结果
+✅ `cargo qemu --ch 2` 通过
+
+### 测试输出
+```
+[ INFO] Hello, rCore-Tutorial ch2!
+[ INFO] Starting batch execution...
+[ INFO] Running app 0: 36880 bytes
+Hello, world!
+[ INFO] Application exited with code 0
+[ INFO] Running app 1: 36880 bytes
+Into Test store_fault, we will insert an invalid store operation...
+Kernel should kill this application!
+[ERROR] Unexpected trap Exception(StoreFault), sepc = 0x8040018e, stval = 0x0
+[ INFO] Running app 2: 40976 bytes
+3^10000=5079(MOD 10007)
+3^20000=8202(MOD 10007)
+...
+Test power OK!
+[ INFO] Application exited with code 0
+[ INFO] Running app 3: 36880 bytes
+Try to execute privileged instruction in U Mode
+Kernel should kill this application!
+[ERROR] Unexpected trap Exception(IllegalInstruction), sepc = 0x804000cc, stval = 0x0
+[ INFO] Running app 4: 36880 bytes
+Try to access privileged CSR in U Mode
+Kernel should kill this application!
+[ERROR] Unexpected trap Exception(IllegalInstruction), sepc = 0x804000cc, stval = 0x0
+[ INFO] All applications finished. Shutting down...
+```
+
+## 实现完成时间
+2026-01-24 约 12:15 (UTC+8)
+
+## 修改的文件汇总
+1. `ch2/build.rs` - 新创建
+2. `ch2/src/main.rs` - 新创建
+3. `kernel-context/src/lib.rs` - 修改（修复执行逻辑）
+4. `linker/src/lib.rs` - 修改（修复地址数组读取）
+5. `user/build.rs` - 新创建
+
+## 日志语言
+中文

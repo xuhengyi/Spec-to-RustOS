@@ -1,0 +1,122 @@
+# ch3 实现日志
+
+## 实现开始时间
+2026-01-24
+
+## 使用的资源
+
+### ✅ 当前 crate 的 spec
+- `openspec/specs/ch3/spec.md` - 主要规格文档
+- `openspec/specs/ch3/design.md` - 设计文档
+
+### ⚠️ 直接依赖的 spec（已使用）
+- `openspec/specs/kernel-context/spec.md` - 需要了解 `LocalContext` 的 API，包括 `user()`、`execute()`、`a()`、`a_mut()`、`sp_mut()`、`move_next()` 等方法的具体签名
+- `openspec/specs/syscall/spec.md` - 需要了解 syscall 子系统的初始化 API 和 `handle()` 函数、`SyscallResult` 枚举等
+- `openspec/specs/linker/spec.md` - 需要了解 `boot0!`、`KernelLayout`、`AppMeta` 的 API
+- `openspec/specs/console/spec.md` - 需要了解 `Console` trait、`init_console()`、`set_log_level()` 的接口
+
+**使用原因**: ch3 spec 描述了该内核的行为和要求，但具体的 trait 签名、方法参数等需要参考直接依赖的 spec 来确保接口兼容性。
+
+### ❌ 已生成的代码（已使用）
+- `syscall/src/kernel.rs` - 第一次编译失败后，查看了该文件以了解 trait 方法的具体签名
+
+**使用原因**: 
+- 第一次编译时遇到 trait 方法签名不匹配的错误（如 `write` 的 buf 参数类型、`exit` 的参数类型等）
+- syscall spec 只描述了功能而没有详细的 trait 方法签名
+- 需要查看实际代码确认 `IO`、`Process`、`Scheduling`、`Clock` trait 的确切签名
+
+## 实现过程
+
+### 1. 阅读 spec
+首先阅读了 `spec.md` 和 `design.md`，了解 ch3 的主要功能：
+- 多道程序执行内核
+- 轮转调度（默认抢占式，可选协作式 `coop` feature）
+- syscall 宿主实现（WRITE、CLOCK_GETTIME 等）
+
+### 2. 创建 build.rs
+根据 spec 要求创建 `build.rs`：
+- 将 `linker::SCRIPT` 写入 `$OUT_DIR/linker.ld`
+- 通过 `cargo:rustc-link-arg` 传递给链接器
+- 设置 `rerun-if-changed` 和 `rerun-if-env-changed`
+
+### 3. 第一次实现 main.rs（遇到编译错误）
+初始实现包含：
+- `boot0!` 宏导出入口
+- `global_asm!` 内联应用程序
+- BSS 清零
+- console/log 初始化
+- syscall 子系统初始化
+- 任务控制块和轮转调度
+- trap 处理
+
+**编译错误**:
+1. 使用了 `heapless` crate（未在 Cargo.toml 中声明）
+2. syscall trait 方法签名不匹配：
+   - `write` 的 buf 参数应为 `*const u8` 而非 `usize`
+   - `read` 的 buf 参数应为 `*mut u8` 而非 `usize`
+   - 缺少 `open`、`close`、`waitpid` 方法
+   - `exit` 的参数应为 `i32` 而非 `usize`
+   - `exec` 和 `wait` 的参数数量不对
+   - `clock_gettime` 的 tp 参数应为 `*mut TimeSpec` 而非 `usize`
+
+### 4. 查看 syscall 实现代码
+读取 `syscall/src/kernel.rs` 了解 trait 的确切签名。
+
+### 5. 修复实现
+- 移除 `heapless`，改用静态数组存储任务
+- 为每个应用静态分配用户栈
+- 修正所有 trait 方法签名
+- 添加缺失的 `open`、`close`、`waitpid` 方法
+
+### 6. 第二次编译并测试
+运行 `cargo qemu --ch 3`，测试通过。
+
+## 测试结果
+
+### Gate 验证
+✅ `cargo qemu --ch 3` 通过
+
+### 测试用例验证
+所有 12 个测试用例都正确运行：
+- ✅ 00hello_world - 输出 "Hello, world!"
+- ✅ 01store_fault - 非法存储访问，被内核杀死
+- ✅ 02power - 计算幂次并输出 "Test power OK!"
+- ✅ 03priv_inst - 特权指令访问，被内核杀死
+- ✅ 04priv_csr - 特权 CSR 访问，被内核杀死
+- ✅ 05write_a - 输出 AAAAAA...
+- ✅ 06write_b - 输出 BBBBBB...
+- ✅ 07write_c - 输出 CCCCCC...
+- ✅ 08power_3 - 计算 3 的幂次
+- ✅ 09power_5 - 计算 5 的幂次
+- ✅ 10power_7 - 计算 7 的幂次
+- ✅ 11sleep - 测试 clock_gettime 和 sched_yield
+
+### 一次生成是否通过
+❌ 否
+
+第一次生成的代码有编译错误，需要修复 trait 签名和依赖问题。
+
+## 修改流程
+1. 第一次实现 → 编译失败（trait 签名不匹配，heapless 未声明）
+2. 读取 syscall/src/kernel.rs 了解正确签名
+3. 修复所有 trait 方法签名，移除 heapless 依赖
+4. 第二次编译 → 成功
+
+## 实现完成时间
+2026-01-24
+
+## 最终实现文件
+- `ch3/build.rs` - 构建脚本
+- `ch3/src/main.rs` - 内核主程序
+
+## 实现要点总结
+1. 使用 `linker::boot0!` 宏导出 `_start` 入口
+2. 通过 `global_asm!(include_str!(env!("APP_ASM")))` 内联应用程序
+3. BSS 清零后初始化 console 和 syscall 子系统
+4. 枚举应用并为每个应用创建任务控制块
+5. 开启 supervisor timer interrupt
+6. 轮转调度执行所有任务
+7. 处理 trap：SupervisorTimer（时间片耗尽）、UserEnvCall（syscall）、其他异常（杀死任务）
+8. 实现 IO::write 支持 STDOUT/STDDEBUG
+9. 实现 Clock::clock_gettime 支持 CLOCK_MONOTONIC
+10. 支持 `coop` feature 切换到协作式调度

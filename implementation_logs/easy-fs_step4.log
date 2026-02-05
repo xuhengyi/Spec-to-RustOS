@@ -1,0 +1,97 @@
+# easy-fs Step 4: fs-manager 实现日志
+
+## 实现开始时间
+2026-01-26 开始实现
+
+## 使用的资源
+
+### ✅ 当前模块的 spec
+- `openspec/specs/fs-manager/spec.md` - 主要参考
+- `openspec/specs/fs-manager/design.md` - 设计决策参考
+
+### ⚠️ 直接依赖的 spec
+无需访问。当前模块的 spec 足以理解接口需求。
+
+### ❌ 已生成的代码
+仅查看了已实现的 layout.rs 和 block_cache.rs 的导出接口，用于了解：
+- `Bitmap::new()`, `Bitmap::alloc()`, `Bitmap::dealloc()` 的签名
+- `DiskInode`, `DiskInodeType`, `SuperBlock` 的结构和方法
+- `get_block_cache()`, `block_cache_sync_all()` 的使用方式
+
+这些都是正常的模块间接口使用，不属于"下下策"访问。
+
+## 实现过程
+
+### 1. 分析 spec 要求
+
+根据 spec，需要实现 `EasyFileSystem` 结构体，包含：
+- `block_device: Arc<dyn BlockDevice>`
+- `inode_bitmap: Bitmap`
+- `data_bitmap: Bitmap`
+- `inode_area_start_block: u32`
+- `data_area_start_block: u32`
+
+需要实现的方法：
+- `create(block_device, total_blocks, inode_bitmap_blocks) -> Arc<Mutex<Self>>`
+- `open(block_device) -> Arc<Mutex<Self>>`
+- `root_inode(efs) -> Inode` (注：Inode 类型在 step 5 定义，此方法将在 step 5 实现)
+- `get_disk_inode_pos(inode_id) -> (u32, usize)`
+- `get_data_block_id(data_block_id) -> u32`
+- `alloc_inode(&mut self) -> u32`
+- `alloc_data(&mut self) -> u32`
+- `dealloc_data(&mut self, block_id)`
+
+### 2. 磁盘布局计算
+
+根据 SuperBlock 结构和 spec 要求，设计磁盘布局：
+```
+| SuperBlock(1) | inode_bitmap | inode_area | data_bitmap | data_area |
+```
+
+关键计算：
+- `BLOCK_BITS = 512 * 8 = 4096`（每块可管理的 bit 数）
+- `INODES_PER_BLOCK = 512 / 128 = 4`（每块可存储的 inode 数）
+- `inode_area_blocks = inode_bitmap_blocks * BLOCK_BITS / INODES_PER_BLOCK`
+- `data_bitmap_blocks = (data_total_blocks + BLOCK_BITS) / (BLOCK_BITS + 1)`
+
+### 3. 关于 root_inode 方法
+
+spec 要求 `root_inode(efs)` 返回 `Inode` 类型，但 `Inode` 定义在 vfs-inode 模块（step 5）。
+根据依赖关系，vfs-inode 依赖 fs-manager，所以 root_inode 方法将在 step 5 实现。
+
+### 4. 创建 efs.rs 文件
+
+创建了 `easy-fs/src/efs.rs`，包含：
+- `EasyFileSystem` 结构体定义
+- `create()` 方法：创建文件系统，清零所有块，初始化 SuperBlock，分配根目录 inode
+- `open()` 方法：读取并验证 SuperBlock，构建文件系统实例
+- `get_disk_inode_pos()` 方法：计算 inode 在磁盘上的位置
+- `get_data_block_id()` 方法：计算数据块的绝对块号
+- `alloc_inode()` 方法：从 inode 位图分配
+- `alloc_data()` 方法：从数据位图分配，返回绝对块号
+- `dealloc_data()` 方法：清零块内容并回收到位图
+
+### 5. 更新 lib.rs
+
+在 `lib.rs` 中添加了：
+- `mod efs;` 声明
+- `pub use efs::EasyFileSystem;` 导出
+
+## 测试结果
+
+✅ `cargo check` 通过
+
+```
+    Checking easy-fs v0.1.0 (/home/xu-hy22/Graduation/rCore-Tutorial-validated-with-unit-tests/easy-fs)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.14s
+```
+
+**一次生成通过**：是。第一次运行 `cargo check` 除警告信息外没有报错信息，直接编译成功。
+
+## 实现完成时间
+2026-01-26 完成
+
+## 实现文件清单
+
+1. `easy-fs/src/efs.rs` - 新增，包含 EasyFileSystem 实现
+2. `easy-fs/src/lib.rs` - 修改，添加 efs 模块和 EasyFileSystem 导出

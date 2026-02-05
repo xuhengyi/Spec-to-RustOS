@@ -1,0 +1,86 @@
+# linker crate 实现日志
+
+## 实现开始时间
+2026-01-24
+
+## 使用的资源
+- ✅ 当前 crate 的 spec: `openspec/specs/linker/spec.md`
+- ✅ 当前 crate 的 design: `openspec/specs/linker/design.md`
+- ⚠️ 直接依赖的 spec: 无（linker crate 无直接依赖）
+- ❌ 已生成的代码: 未使用
+
+## 实现过程
+
+### 1. 阅读 spec 和 design 文档
+已阅读 `openspec/specs/linker/spec.md` 和 `openspec/specs/linker/design.md`，理解了以下需求：
+- 需要导出链接脚本 `SCRIPT: &[u8]`
+- 需要实现 `boot0!` 宏定义启动入口
+- 需要实现 `KernelLayout` 结构体读取内核布局
+- 需要实现 `AppMeta` 和 `AppIterator` 遍历应用程序
+
+### 2. 实现链接脚本
+创建了 `src/linker.ld` 文件，实现了 RISC-V 链接脚本：
+- 将 `.text` 段起始地址固定在 `0x80200000`
+- 定义了段布局：`.text` → `.rodata` → `.data` → `.bss` → `.boot`
+- 导出符号 `__start`、`__rodata`、`__data`、`__sbss`、`__ebss`、`__boot`、`__end`
+- 在 `.boot` 段中使用 `KEEP(*(.boot.stack))` 确保启动栈不被丢弃
+- 使用 `include_bytes!` 宏将链接脚本内容作为 `SCRIPT` 常量导出
+
+### 3. 实现 KernelLayout 结构体
+实现了 `KernelLayout` 结构体及其方法：
+- `INIT` 常量：所有字段初始化为 `usize::MAX`
+- `locate()` 方法：通过 `extern "C"` 声明链接符号，读取其地址填充布局信息
+- `start()`、`end()`、`len()` 方法：返回相应的布局信息
+- `zero_bss()` 方法：使用 `write_volatile` 将 BSS 段清零
+- `iter()` 方法：返回 `KernelRegionIterator`，按顺序迭代 Text → Rodata → Data → Boot 四个区域
+
+### 4. 实现 KernelRegionIterator 和相关类型
+- `KernelRegionIterator`：实现了 `Iterator` trait，按固定顺序返回四个区域
+- `KernelRegionTitle`：枚举类型，表示区域名称（Text/Rodata/Data/Boot）
+- `KernelRegion`：包含 `title` 和 `range` 的结构体
+- 为 `KernelRegion` 实现了 `Display` trait，用于格式化输出
+
+### 5. 实现 AppMeta 和 AppIterator
+- `AppMeta`：使用 `#[repr(C)]` 定义，包含 `base`、`step`、`count`、`first` 四个 `u64` 字段
+- `AppMeta::locate()`：通过 `extern "C"` 声明 `apps` 符号，返回静态引用
+- `AppMeta::iter()`：返回 `AppIterator`
+- `AppIterator`：实现了 `Iterator<Item = &'static [u8]>`
+  - 读取地址数组（位于 `first` 字段之后，长度为 `count+1`）
+  - 计算每个 app 的位置和大小
+  - 如果 `base != 0`，将 app 拷贝到固定槽位并清零剩余空间
+  - 如果 `base == 0`，直接返回原始位置的切片
+
+### 6. 实现 boot0! 宏
+实现了 `boot0!` 宏：
+- 在 `.boot.stack` 段中定义静态可变启动栈 `STACK`
+- 定义 `#[no_mangle] unsafe extern "C" fn _start() -> !`
+- 使用 `#[link_section = ".text.entry"]` 将 `_start` 放入 `.text.entry` 段
+- 在 `_start` 中使用内联汇编设置栈指针 `sp = __end`，然后跳转到 `rust_main`
+- 使用 `no_run` 标记 doctest，因为汇编代码只能在 RISC-V 目标上编译
+
+### 7. 修复和优化
+- 修复了 `AppIterator::next()` 中索引递增的问题
+- 修复了地址数组读取逻辑：地址数组位于 `first` 字段之后
+- 修复了 doctest 编译问题：使用 `no_run` 标记避免在主机架构上运行 RISC-V 汇编代码
+- 将所有指针操作放在 `unsafe` 块中，确保符合 Rust 安全要求
+
+## 测试结果
+
+### 第一次运行测试
+- `cargo check`：✅ 通过
+- `cargo test`：❌ doctest 失败（RISC-V 汇编在主机架构上无法编译）
+
+### 修复后运行测试
+- `cargo check`：✅ 通过
+- `cargo test`：✅ 所有测试通过
+  - 11 个单元测试全部通过
+  - 1 个 doctest 通过（使用 `no_run` 标记）
+
+### 代码生成情况
+代码是一次性生成的，但经过了一次修复：
+1. 第一次实现后，发现 doctest 失败，修复了 doctest 标记
+2. 修复了 `AppIterator` 中地址数组的读取逻辑
+3. 最终所有测试通过
+
+## 实现完成时间
+2026-01-24

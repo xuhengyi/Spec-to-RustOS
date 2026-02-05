@@ -1,0 +1,27 @@
+# kernel-vm 实现日志
+
+## 1. 实现开始时间
+2025-01-30
+
+## 2. 使用的资源
+- 当前 crate 的 spec: openspec/specs/kernel-vm/spec.md, design.md
+- 直接依赖的 spec: 未使用
+- 已生成的代码: 未使用
+
+为确认 page-table API 查阅了 docs.rs 上 page-table 0.0.6 文档。
+
+## 3. 实现过程
+- 按 spec 实现 PageManager trait 与 AddressSpace 结构体。
+- map_extern 使用 Decorator 逐 VPN 建立映射，meet/block 未完成路径使用 todo!()。
+- map 中 allocate、零填充与拷贝、再 map_extern。
+- translate 使用 Visitor 遍历到叶子，meet 中通过 manager.p_to_v 返回下级指针。
+- cloneself 对每个 area 取首 PTE 的 ppn/flags，allocate 后拷贝再 map_extern。
+- Debug 输出 root 物理页号及 PageTableFormatter。
+
+遇到的问题: cloneself 中 TranslateVisitor 初始化漏写 manager 字段已补上; 文件末尾误入内容已截断。
+
+## 4. 测试结果
+cargo check 与 cargo test 均通过，8 个 api_tests 全部通过。非首次即过，经小修后通过。
+
+## 5. 实现完成时间
+2025-01-30

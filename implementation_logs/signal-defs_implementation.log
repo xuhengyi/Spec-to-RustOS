@@ -1,0 +1,100 @@
+# signal-defs 实现日志
+
+## 实现开始时间
+2026-01-24
+
+## 使用的资源
+
+### ✅ 当前 crate 的 spec
+- `openspec/specs/signal-defs/spec.md`: 完整阅读并理解了所有需求
+
+### ⚠️ 直接依赖的 spec
+- 无直接依赖
+
+### ❌ 已生成的代码
+- 未访问已生成的代码
+
+## 实现过程
+
+### 1. 阅读 spec 和理解需求
+- 阅读了 `openspec/specs/signal-defs/spec.md`，理解了所有需求：
+  - `SignalAction` 结构体需要 `#[repr(C)]`，包含 `handler: usize` 和 `mask: usize` 两个字段
+  - 需要派生 `Debug`, `Clone`, `Copy`, `Default`
+  - `SignalNo` 枚举需要 `#[repr(u8)]`，包含 ERR (0)、传统信号 (1-31) 和实时信号 (32-63)
+  - 需要使用 `numeric-enum-macro` 生成 `TryFrom<u8>` 实现
+  - 需要实现 `From<usize>`，先转换为 `u8`，再 `try_from`，失败返回 `ERR`
+  - 需要定义 `MAX_SIG: usize = 31` 常量
+  - 必须在 `#![no_std]` 环境下工作
+
+### 2. 查找 numeric-enum-macro 的使用方式
+- 通过 web 搜索了解了 `numeric-enum-macro` 0.2.0 的使用方式
+- 确认了 `numeric_enum!` 宏的语法和功能
+- 了解到该宏会自动生成 `TryFrom<u8>` trait 实现
+
+### 3. 实现 SignalAction 结构体
+- 定义了 `#[repr(C)]` 结构体
+- 添加了两个 `pub` 字段：`handler: usize` 和 `mask: usize`（按顺序）
+- 派生 `Debug`, `Clone`, `Copy`, `Default`
+- 添加了文档注释说明用途
+
+### 4. 实现 SignalNo 枚举
+- 使用 `numeric_enum!` 宏定义枚举
+- 设置 `#[repr(u8)]` 和必要的 derive traits：`Debug`, `Clone`, `Copy`, `PartialEq`, `Eq`
+- 定义了所有信号编号：
+  - `ERR = 0`
+  - 传统信号 `SIGHUP = 1` 到 `SIGSYS = 31`（共 31 个）
+  - 实时信号 `SIGRTMIN = 32` 到 `SIGRT31 = 63`（共 32 个）
+- `numeric_enum!` 宏自动生成了 `TryFrom<u8>` trait 实现
+
+### 5. 实现 From<usize> trait
+- 实现了 `impl From<usize> for SignalNo`
+- 转换逻辑：
+  1. 先将 `usize` 转换为 `u8`（使用 `as` 转换，可能发生截断）
+  2. 调用 `SignalNo::try_from(num_u8)`
+  3. 如果成功返回对应变体，否则返回 `SignalNo::ERR`
+- 符合 spec 中描述的转换语义
+
+### 6. 定义 MAX_SIG 常量
+- 定义了 `pub const MAX_SIG: usize = 31`
+- 与 `SignalNo::SIGSYS = 31` 对齐
+
+### 7. 验证和调试
+- 第一次运行 `cargo check` 时发现一个警告：`numeric_enum!` 宏生成的枚举不能直接添加文档注释
+- 移除了枚举上方的文档注释，解决了警告
+- 运行 `cargo test` 时所有 16 个测试全部通过
+- 再次运行 `cargo check` 确认没有警告
+
+## 测试结果
+
+### Gate 验证
+- ✅ `cargo check`: 通过，无警告
+- ✅ `cargo test`: 通过，16 个测试全部通过
+
+### 测试覆盖
+所有测试用例均通过：
+1. `test_signal_action_basic`: SignalAction 基本功能
+2. `test_signal_action_default`: Default trait
+3. `test_signal_action_clone`: Clone trait
+4. `test_signal_action_copy`: Copy trait
+5. `test_signal_action_debug`: Debug trait
+6. `test_max_sig`: MAX_SIG 常量
+7. `test_signal_no_basic`: SignalNo 基本值（0-15）
+8. `test_signal_no_standard_signals`: 标准信号（16-31）
+9. `test_signal_no_rt_signals`: 实时信号（32-63）
+10. `test_signal_no_from_usize`: From<usize> 转换（有效值）
+11. `test_signal_no_from_usize_invalid`: From<usize> 转换（无效值返回 ERR）
+12. `test_signal_no_eq`: Eq 和 PartialEq trait
+13. `test_signal_no_copy`: Copy trait
+14. `test_signal_no_clone`: Clone trait
+15. `test_signal_no_debug`: Debug trait
+16. `test_signal_no_ordering`: 信号编号的数值顺序
+
+### 代码生成情况
+- ✅ **一次生成通过**: 第一次运行 `cargo test` 时，除警告信息外没有报错，所有测试直接通过
+- 仅进行了微调：移除了无法应用到宏生成枚举的文档注释以避免警告
+
+## 实现完成时间
+2026-01-24
+
+## 总结
+实现完全基于 spec 文档，没有访问任何已生成的代码。使用 `numeric-enum-macro` 简化了枚举定义和 `TryFrom<u8>` 的实现。所有功能按照 spec 要求正确实现，测试全部通过。

@@ -1,0 +1,70 @@
+# task-manage crate 实现日志
+
+## 实现开始时间
+2026-01-30
+
+## 使用的资源
+- ✅ 当前 crate 的 spec: `openspec/specs/task-manage/spec.md`
+- ✅ 当前 crate 的 design: `openspec/specs/task-manage/design.md`
+- ⚠️ 直接依赖的 spec: 无（task-manage crate 无直接依赖）
+- ❌ 已生成的代码: 未使用
+
+## 实现过程
+
+### 1. 阅读 spec 和 design 文档
+已阅读 `openspec/specs/task-manage/spec.md` 和 `openspec/specs/task-manage/design.md`，理解了以下需求：
+
+**核心类型与 traits：**
+- `ProcId`、`ThreadId`、`CoroId`：单调递增的任务标识符，需实现 Copy、Ord、Hash、Debug
+- `Manage<T, I>` trait：任务存储抽象，提供 insert、delete、get_mut
+- `Schedule<I>` trait：就绪队列抽象，提供 add、fetch
+
+**Feature proc：**
+- `ProcRel`：进程树父子关系追踪，支持 add_child、del_child、wait_any_child、wait_child
+- `PManager`：进程管理辅助，结合 Manage、Schedule 与 ProcRel
+
+**Feature thread：**
+- `ProcThreadRel`：进程-线程关系，在 ProcRel 基础上增加 add_thread、del_thread、wait_thread
+- `PThreadManager`：进程+线程联合管理
+
+### 2. 实现任务标识符类型
+使用宏 `impl_id_type!` 统一实现 ProcId、ThreadId、CoroId：
+- 每个类型有独立的 `AtomicUsize` 计数器，`new()` 使用 `fetch_add` 保证单调递增
+- `from_usize` / `get_usize` 用于与原始值互转
+- 实现 Clone、Copy、PartialEq、Eq、PartialOrd、Ord、Hash、Debug
+
+### 3. 实现 Manage 和 Schedule traits
+- `Manage<T, I>`：泛型 trait，I 需满足 Copy + Ord
+- `Schedule<I>`：泛型 trait，仅定义接口，具体实现由调用方提供（如测试中的 TestManager、TestScheduler）
+
+### 4. 实现 ProcRel（feature proc）
+- `ProcRel` 维护 parent、children、dead_children
+- `wait_any_child`：无子进程返回 None；有活跃子进程无已死子进程时返回 sentinel `(ProcId::from_usize(usize::MAX - 1), -1)`；否则返回已死子进程
+- `wait_child`：按 spec 返回对应结果
+
+### 5. 实现 PManager（feature proc）
+- 组合 Option<MP>（Manage + Schedule）、BTreeMap<ProcId, ProcRel>、current: Option<ProcId>
+- `find_next` 存在借用冲突：需在持有 `&mut P` 返回的同时修改 `self.current`。使用 `*mut Self`  raw pointer 在 unsafe 块中完成 disjoint 字段的分离访问
+- `make_current_exited`：删除进程、更新父进程 ProcRel、将子进程 reparent 到 init (ProcId::from_usize(0))
+- `Default` impl 需添加与主 impl 相同的 trait bounds
+
+### 6. 实现 ProcThreadRel 和 PThreadManager（feature thread）
+- `ProcThreadRel` 在 ProcRel 基础上增加 threads、dead_threads，以及 add_thread、del_thread、wait_thread
+- `PThreadManager` 组合 thread_manager、proc_manager、relations、tid2pid、current
+- `del_proc` 需先保存 parent 和 thread_ids，再 remove，避免使用已移除的 rel
+- `make_current_exited` 中用块作用域获取 active_count，避免 drop 引用产生的 warning
+
+### 7. 遇到的编译错误与修复
+- **E0599 (Default)**：`PManager`/`PThreadManager` 的 `Default` impl 需添加 `where MP: Manage<P, ProcId> + Schedule<ProcId>` 等 bounds
+- **E0499 / E0506 (借用)**：`find_next` 中返回 `&mut P` 的同时修改 `self.current` 导致多次可变借用。通过 `let self_ptr: *mut Self = self` 并在 unsafe 块中访问解决 disjoint 字段的分离写
+- **dropping_references warning**：`drop(rel)` 对引用无效，改为用块作用域 `{ let rel = ...; rel.del_thread(...); rel.threads.len() }` 自然结束借用
+
+## 测试结果
+- `cargo check` 通过
+- `cargo test` 通过（26 个 api_tests）
+- `cargo test --features "proc,thread"` 通过
+
+代码在修复上述编译错误后通过测试，非第一次生成即通过。
+
+## 实现完成时间
+2026-01-30

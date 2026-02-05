@@ -1,0 +1,82 @@
+# ch1 实现日志
+
+## 实现开始时间
+2026-01-24 (周六)
+
+## 使用的资源
+- ✅ 当前 crate 的 spec: `openspec/specs/ch1/spec.md` 和 `design.md`
+- ✅ `ch1/Cargo.toml` - 了解依赖配置
+- ✅ `user/cases.toml` - 查看测试用例配置（发现 ch1 没有专门的测试用例配置）
+
+**未访问直接依赖的 spec**：ch1 没有直接依赖其他 crate（除了 sbi-rt 外部依赖）
+
+**未访问已生成的代码**：实现完全基于 spec 完成
+
+## 实现过程
+
+### 1. 阅读 spec 和 design
+阅读了 `openspec/specs/ch1/spec.md` 和 `design.md`，了解到 ch1 是一个最小化的 RISC-V S-mode 裸机二进制程序，需要：
+- 提供 `_start` 入口符号，放置在 `.text.entry` 段
+- 设置 4096 字节的栈空间在 `.bss.uninit` 段
+- 打印 "Hello, world!" 通过 SBI legacy console output
+- 通过 `sbi_rt::system_reset(Shutdown, NoReason)` 请求关机
+- panic handler 通过 `sbi_rt::system_reset(Shutdown, SystemFailure)` 请求关机
+
+### 2. 创建 build.rs
+根据 spec 中的 Build Configuration 要求，创建了 `build.rs`：
+- 将链接脚本 `linker.ld` 写入 `OUT_DIR`
+- 链接脚本定义 `OUTPUT_ARCH(riscv)`，`.text` 从 `0x80200000` 开始，`.text.entry` 放在最前面
+- 传递 `-T<OUT_DIR>/linker.ld` 给链接器
+- 设置 `cargo:rerun-if-changed=build.rs`
+
+### 3. 创建 main.rs
+实现了以下内容：
+- `#![no_std]` 和 `#![no_main]` 属性
+- `STACK` 静态变量：4096 字节，放在 `.bss.uninit` 段
+- `_start()` 函数：naked 函数，设置栈指针，跳转到 `rust_main`
+- `rust_main()` 函数：打印 "Hello, world!"，调用 `system_reset(Shutdown, NoReason)`
+- `panic_handler`：调用 `system_reset(Shutdown, SystemFailure)`
+
+### 4. 第一次编译错误
+运行 `cargo qemu --ch 1` 时遇到编译错误：
+1. `#![feature(naked_functions)]` - 该特性在 Rust 1.88.0 后已稳定，不再需要 feature 属性
+2. `asm!` 宏在 naked 函数中不允许使用，需要使用 `naked_asm!` 宏
+
+### 5. 修复错误
+- 移除 `#![feature(naked_functions)]` 行
+- 将 `use core::arch::asm` 改为 `use core::arch::naked_asm`
+- 将 `_start` 函数中的 `asm!` 改为 `naked_asm!`，并移除 `options(noreturn)`（naked_asm 隐式包含）
+
+### 6. 第二次编译测试
+再次运行 `cargo qemu --ch 1`，编译成功，输出：
+```
+Hello, world!
+```
+
+## 测试结果
+- **Gate 验证**: ✅ 通过
+- **一次生成通过测试**: ❌ 否
+
+第一次生成的代码由于 Rust 版本问题（naked_functions 特性已稳定、需要使用 naked_asm! 而非 asm!）导致编译失败。修复后第二次编译成功。
+
+### 输出验证
+- 程序正确打印了 "Hello, world!"
+- 程序正常通过 SBI system_reset 关机
+- 由于 `user/cases.toml` 中没有 `[ch1]` 配置，ch1 是一个独立的最小化内核，不加载用户程序
+
+## 最终代码
+
+### build.rs
+- 生成链接脚本到 OUT_DIR
+- 配置链接器使用该脚本
+
+### src/main.rs
+- 入口点 `_start`：设置栈，跳转到 rust_main
+- `rust_main`：打印 "Hello, world!"，请求关机
+- `panic_handler`：请求系统失败关机
+
+## 实现完成时间
+2026-01-24 (周六)
+
+## 警告说明
+编译时有关于 `sbi_rt::legacy::console_putchar` 被废弃的警告，这是因为 SBI legacy 扩展在新版本中被废弃。但根据 spec 要求，仍需使用 legacy console output，因此保留此警告。
