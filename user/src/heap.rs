@@ -1,4 +1,4 @@
-﻿use alloc::alloc::handle_alloc_error;
+use alloc::alloc::handle_alloc_error;
 use core::{
     alloc::{GlobalAlloc, Layout},
     ptr::NonNull,
