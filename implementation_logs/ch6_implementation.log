@@ -1,0 +1,127 @@
+# ch6 实现日志
+
+## 实现开始时间
+2026-02-24
+
+## 使用的资源
+
+1. ✅ 当前 crate 的 spec
+- `openspec/specs/ch6/spec.md`
+- `openspec/specs/ch6/design.md`
+
+2. ⚠️ 直接依赖的 spec
+- 本轮未额外读取依赖 crate 的 spec 文件。
+- 原因：`ch6` 的 spec 已给出行为契约，接口细节通过读取依赖 crate 源码确认。
+
+3. ⚠️ 读取了直接依赖/相关源码（用于接口确认）
+- `easy-fs/src/lib.rs`
+- `easy-fs/src/vfs.rs`
+- `syscall/src/lib.rs`
+- `syscall/src/kernel.rs`
+- `syscall/src/user.rs`
+- `task-manage/src/lib.rs`
+- `kernel-vm/src/lib.rs`
+- `kernel-context/src/lib.rs`
+- `xtask/src/main.rs`
+- `xtask/src/user.rs`
+- `xtask/src/fs_pack.rs`
+- 以及 `virtio-drivers` 对应 git checkout 的 `src/{lib.rs,hal.rs,blk.rs,header.rs}`
+
+4. ❌ 已生成代码（下下策访问，已记录原因）
+- 访问文件：`ch5/src/main.rs`（以及少量 `ch4/src/main.rs` 片段）
+- 访问原因：`ch6/src/main.rs` 初始为空文件，无法从 0 推断 portal/trap/调度主循环细节；需要先借鉴前一章的稳定骨架，再叠加 ch6 的 easy-fs + virtio 功能。
+- 学到内容：
+  - 现有工程的 `Sv39Manager` 实现方式
+  - `PManager` 调度主循环与 wait/fork 约定
+  - portal trampolines 与 `__trap_handler` 协作方式
+- 为什么是下下策：规范优先已经覆盖行为；这里访问旧代码仅用于降低空文件起步的结构性风险，后续行为仍按 ch6 spec 对齐。
+
+## 实现过程（关键动作与调试轨迹）
+
+### 1) 初始实现落地
+- 新增 `ch6/build.rs`：
+  - 生成 `linker.ld`
+  - 注入 `cargo:rustc-link-arg=-T...`
+  - 跟踪 `build.rs`/`LOG`/`APP_ASM`
+- 完整实现 `ch6/src/main.rs`，包含：
+  - 启动与 `.bss` 清零
+  - 堆初始化与内存转移
+  - Sv39 内核地址空间映射（内核段、heap、portal transit、MMIO）
+  - virtio-blk + easy-fs（全局 `BLOCK_DEVICE` 与 `FS`）
+  - ELF 装载、`Process::{from_elf,fork,exec}`
+  - fd table、`read/write/open/close`
+  - `wait/waitpid/getpid/clock_gettime`
+  - trap/syscall 主循环与退出策略
+
+### 2) 首轮编译失败：`alloc` 符号冲突
+- 触发命令：`cargo qemu --ch 6`
+- 关键报错：
+  - `E0254 the name alloc is defined multiple times`
+  - `cannot find function dealloc/alloc_zeroed/handle_alloc_error in crate alloc`
+- 根因：把 `extern crate alloc;` 与 `use alloc::alloc;` 混用，导致函数路径写成模块路径。
+- 修复：
+  - 改为显式导入函数：`use alloc::alloc::{alloc, alloc_zeroed, dealloc, handle_alloc_error};`
+  - 全量替换调用点。
+
+### 3) 首轮运行失败：`InstructionPageFault`（portal 地址别名错误）
+- 触发命令：`timeout 180s cargo qemu --ch 6`
+- 关键现象：
+  - 内核启动、virtio 识别成功
+  - 随后报错：`trap Exception(InstructionPageFault) stval=0x80249008 sepc=0x80249008`
+  - 最终 `no task`
+- 定位思路：
+  - `0x8024...` 是内核堆地址，不是用户态可执行映射地址。
+  - `ForeignContext::execute` 使用 portal 对象地址计算 transit entry。
+  - 当 portal 对象引用的是“内核堆别名”而非 `PORTAL_VPN` 映射别名时，会让用户态跳到内核堆 VA 执行，触发指令页故障。
+- 修复：
+  - portal 初始化仍用分配得到的物理页别名。
+  - 运行时改为取 `PORTAL_VPN` 对应 VA 的 portal 引用：
+    - `let portal_va = VAddr::<Sv39>::new(PORTAL_VPN << 12).val();`
+    - `let portal = unsafe { &mut *(portal_va as *mut MultislotPortal) };`
+  - 保证内核和用户对 transit 地址一致。
+
+### 4) 集成验证中的环境问题：`fs.img` 写锁冲突
+- 触发场景：重复启动 qemu 时，出现 `Failed to get "write" lock`。
+- 根因：上一轮 qemu 进程仍在后台占用镜像。
+- 处理：结束残留 qemu 进程后重新跑验证。
+
+### 5) 用例级输出验证（按 `user/cases.toml` 的 ch6 列表）
+- 执行命令：
+  - `timeout 240s bash -lc 'printf "00hello_world\n01store_fault\n02power\n03priv_inst\n04priv_csr\n12forktest\n13forktree\n14forktest2\n15matrix\nfiletest_simple\ncat_filea\n" | cargo qemu --ch 6 > /tmp/ch6_run.log 2>&1'`
+- 人工对照 `user/src/bin/*.rs` 的预期：
+  - `00hello_world`：输出 `Hello, world!`，退出码 0
+  - `01store_fault`：触发 `StorePageFault`，退出码 -3
+  - `02power`：输出幂模计算结果并 `Test power OK!`，退出码 0
+  - `03priv_inst`：`IllegalInstruction`，退出码 -3
+  - `04priv_csr`：`IllegalInstruction`，退出码 -3
+  - `12forktest`：`forktest pass.`
+  - `13forktree`：进程树输出完成，退出码 0
+  - `14forktest2`：`forktest2 test passed!`
+  - `15matrix`：`matrix passed.`
+  - `filetest_simple`：`file_test passed!`
+  - `cat_filea`：成功打印 `Hello, world!`
+- 关键日志位置：`/tmp/ch6_run.log`（已检查对应片段）。
+
+## 修改文件
+- `ch6/build.rs`（新增）
+- `ch6/src/main.rs`（完整实现）
+
+## 测试结果
+
+1. Gate 命令
+- 命令：`cargo qemu --ch 6`
+- 结果：内核可正常启动，进入 `Rust user shell`，无启动期 panic。
+
+2. 用例验证
+- 依据 `user/cases.toml` 的 `[ch6]` 用例，脚本化输入验证通过（见 `/tmp/ch6_run.log`）。
+- 文件系统相关程序 `filetest_simple` / `cat_filea` 输出符合预期。
+
+3. 是否一次生成通过
+- 否。
+- 经历多轮调试（编译路径错误 + portal 地址别名错误 + 运行环境镜像锁）后通过。
+
+## 实现完成时间
+2026-02-24
+
+## 日志语言
+中文
