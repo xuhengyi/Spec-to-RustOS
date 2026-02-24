@@ -13,9 +13,9 @@ pub use syscall::*;
 #[no_mangle]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
+    heap::init(); // 必须在任何可能分配内存的代码之前
     rcore_console::init_console(&Console);
     rcore_console::set_log_level(option_env!("LOG"));
-    heap::init();
 
     extern "C" {
         fn main() -> i32;

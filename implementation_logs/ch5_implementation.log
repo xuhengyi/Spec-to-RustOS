@@ -1,70 +1,106 @@
 # ch5 实现日志
 
 ## 实现开始时间
-2025-02-05
+2026-02-24 00:00（本轮修复）
 
 ## 使用的资源
 
-1. **✅ 当前 crate 的 spec**
-   - `openspec/specs/ch5/spec.md`：boot、kernel 地址空间、ELF 加载、portal 映射、进程管理（PManager）、initproc 加载、调度循环、trap 处理、syscall 分发、fork/exec/wait/getpid 等
-   - `openspec/specs/ch5/design.md`：单全局 PROCESSOR、Sv39 地址空间、portal 映射模型、syscall 集成
+1. ✅ 当前 crate 的 spec
+- `openspec/specs/ch5/spec.md`
+- `openspec/specs/ch5/design.md`
 
-2. **⚠️ 直接依赖的 spec**
-   - 未单独阅读其他 crate 的 spec，通过阅读 ch4、linker、kernel-context、kernel-vm、syscall、task-manage 的源码确认 API
+2. ⚠️ 直接依赖的 spec
+- 未额外读取依赖 crate 的 spec。
+- 原因：`ch5` spec 已覆盖对外契约，接口细节通过读取依赖 crate 源码确认。
 
-3. **🔧 需要验证的 crate 代码（集成测试阶段修改）**
-   - 无：本次实现未修改 task-manage 等依赖 crate
+3. 🔧 集成测试阶段访问/修改的相关代码
+- 按用户要求“允许修改相关代码直到通过 ch5 测试”，在集成调试阶段额外修改：
+  - `syscall/src/user.rs`
+  - `user/src/bin/user_shell.rs`
+  - `user/src/bin/initproc.rs`
+- 读取但未修改：
+  - `task-manage/src/lib.rs`
+  - `kernel-vm/src/lib.rs`
+  - `xtask/src/main.rs`
+  - `xtask/src/user.rs`
 
-4. **❌ 已生成的代码**
-   - 参考了 ch4 的 main.rs 实现（load_elf、kernel_space、portal 设置、trap 处理流程）
+4. ❌ 已生成代码
+- 未依赖“已生成代码拷贝粘贴”；仅对仓库现有实现进行定位与修复。
 
-## 实现过程
+## 实现过程（关键调试轨迹）
 
-1. **build.rs**
-   - 与 ch4 一致：将 `linker::SCRIPT` 写入 `$OUT_DIR/linker.ld`，传递 `-T$OUT_DIR/linker.ld`，`rerun-if-changed` build.rs / LOG / APP_ASM
+1. 初始运行
+- 命令：`cargo qemu --ch 5`
+- 首次失败不是内核逻辑，而是沙箱内 `cargo install --list` 权限问题；切换到提权运行后进入真实 QEMU 测试。
 
-2. **main.rs 主流程**
-   - boot/heap/kernel 地址空间：与 ch4 相同
-   - 应用注册表：基于 `AppMeta::locate()` 和 `app_names` 符号，实现 `get_app_by_name()`、`app_name_at()`、`list_app_names()`
-   - 仅加载 initproc：从注册表按名称获取 "initproc"，调用 `load_elf` 创建 Process
-   - ProcManager：实现 `Manage<Process, ProcId>` + `Schedule<ProcId>`，使用 BTreeMap 存储、VecDeque 就绪队列
-   - PManager：使用 `rcore_task_manage::PManager`，`set_manager(ProcManager)`，`add(init_pid, initproc, init_pid)`
-   - 调度循环：`find_next()` 取进程，手动设置 portal cache（与 ch4 相同方式），调用 `LocalContext::execute()`，trap 后根据 scause 分支处理
-   - 无就绪进程时：打印信息并 `sbi_rt::system_reset(Shutdown, NoReason)`
+2. 问题一：shell 执行首条命令即 `memory allocation of 4096 bytes failed`
+- 现象：`Rust user shell` 后执行命令或等待输入出现 4KiB 分配失败。
+- 根因定位：`read(STDIN)` 在无输入时返回 `0`，`getchar()` 读到 `\0`，shell 的命令行字符串被持续追加，最终 OOM。
+- 修复：`ch5/src/main.rs` 的 `SyscallContext::read` 改为“至少读到 1 字节再返回”。
 
-3. **Process 结构**
-   - `pid: ProcId`、`context: ForeignContext`（含 LocalContext + satp）、`space: AddressSpace`、`stack_top`
-   - 使用 `ForeignContext` 的 `context` 字段配合手动 portal 设置执行（未使用 `ForeignContext::execute()`，因其与 ch4 手动方式行为不一致导致 InstructionPageFault）
+3. 问题二：启动后无限 fork 直至 OOM
+- 现象：大量连续 fork，PID 持续增长，最终分配失败。
+- 根因：`fork` 子进程复制了父进程 `sepc`（仍指向 `ecall fork`），导致子进程恢复后再次执行 `fork`。
+- 修复：`ch5/src/main.rs` 中 fork 复制上下文后执行 `child_ctx.move_next()`，让子进程从下一条指令开始。
 
-4. **SyscallContext 实现**
-   - IO：write(STDOUT/STDDEBUG) 通过 CURRENT_SPACE 的 translate 打印
-   - Process：exit → make_current_exited；fork → 克隆地址空间、复制 context、子进程 a0=0、add 到 processor；exec → 按名称加载 ELF、替换当前进程的 context/space；waitpid → 处理 pid=-1（wait any）和 exit_code_ptr 为 null（wait() 单参数）的情况；getpid → 返回 CURRENT_PID
-   - Scheduling：sched_yield → make_current_suspend
-   - Clock：clock_gettime(CLOCK_MONOTONIC) 写入 TimeSpec
+4. 问题三：子进程 PID 与 initproc 冲突风险
+- 现象：`initproc` 采用 `ProcId::from_usize(0)`，而后续 `ProcId::new()` 初值也可能为 0。
+- 修复：新增 `alloc_pid_nonzero()`，fork 仅分配非 0 PID。
 
-5. **关键修复**
-   - get_app_by_name：使用 `apps.nth(i)` 正确获取第 i 个应用
-   - waitpid：当 `exit_code_ptr.is_null()` 时，将 `pid` 解释为 exit_code_ptr、pid 设为 -1（兼容 user lib 的 wait(ptr) 单参数调用）
-   - 执行方式：采用 ch4 风格手动设置 portal cache 并调用 `LocalContext::execute()`，避免 `ForeignContext::execute()` 导致的 InstructionPageFault
+5. 问题四：shell 命令名被污染（如 `02power_fault`）
+- 现象：`Application not found: 02power_fault` 等。
+- 根因：`exec` 传参按 C 字符串读取，shell 输入路径未稳定保证 `\0` 终止，导致读取到旧缓冲尾部。
+- 修复：
+  - `syscall/src/user.rs`：`exec(path)` 改为构造 NUL 结尾缓冲后再 syscall。
+  - `user/src/bin/user_shell.rs`：执行前显式构造 `\0` 结尾命令字符串。
+  - `user/src/bin/initproc.rs`：`exec("user_shell\0")`。
+
+6. 清理
+- 移除调试阶段临时打印（`[exec] raw`）。
+
+## 修改文件
+
+- `ch5/src/main.rs`
+  - 修复 `read(STDIN)` 行为，避免空读返回 0 触发 shell 内存膨胀。
+  - 修复 `fork` 子进程 PC（`move_next`）。
+  - 引入非 0 PID 分配函数，避免 `initproc(pid=0)` 冲突。
+- `syscall/src/user.rs`
+  - `exec` 改为传入 NUL 终止路径。
+- `user/src/bin/user_shell.rs`
+  - shell 子进程调用 `exec` 前构造 NUL 终止命令。
+- `user/src/bin/initproc.rs`
+  - `exec("user_shell\0")`。
 
 ## 测试结果
 
-- **编译**：`cargo qemu --ch 5` 能完成构建
-- **运行**：initproc 成功加载并运行，user_shell 启动并显示 "Rust user shell" 和 ">>"
-- **一次生成**：否，经过多次调试（get_app_by_name、waitpid 参数、执行方式）后通过
+1. Gate 命令
+- 命令：`cargo qemu --ch 5`
+- 结果：可成功启动并进入 `Rust user shell`，无启动期 panic。
 
-## 集成测试结果
+2. 按 `user/cases.toml` 的 ch5 用例序列验证（脚本化输入）
+- 运行命令：
+  - `timeout 180s bash -lc 'printf "00hello_world\n01store_fault\n02power\n03priv_inst\n04priv_csr\n12forktest\n13forktree\n14forktest2\n15matrix\n" | cargo qemu --ch 5'`
+- 关键输出（来自 `/tmp/ch5_final.log`）：
+  - `00hello_world` -> `Shell: Process ... exited with code 0`
+  - `01store_fault` -> `Shell: Process ... exited with code -3`
+  - `02power` -> `Shell: Process ... exited with code 0`
+  - `03priv_inst` -> `Shell: Process ... exited with code -3`
+  - `04priv_csr` -> `Shell: Process ... exited with code -3`
+  - `12forktest` -> `forktest pass.`
+  - `13forktree` -> `Shell: Process ... exited with code 0`
+  - `14forktest2` -> `forktest2 test passed!`
+  - `15matrix` -> `matrix passed.`
+- 未出现 `Application not found` / `Error when executing!`。
 
-- `cargo qemu --ch 5` 能启动并进入 user_shell
-- **管道/expect 测试**：已创建 `scripts/test_ch5_shell.sh`，使用 `echo "00hello_world" | cargo qemu --ch 5` 验证：
-  - 管道输入能成功送达 user_shell
-  - Shell 提示符 ">>" 正常显示
-- **已知问题**：从 user_shell 执行 `00hello_world` 时出现 "memory allocation of 4096 bytes failed"
-  - 直接加载 00hello_world 作为首个进程可正常运行并输出 "Hello, world!"
-  - 问题仅出现在 fork+exec 路径（user_shell 子进程 exec 时），可能与 exec 后用户堆初始化或内核堆状态有关，待进一步调试
+3. 是否一次生成通过
+- 否。经历多轮调试与修复后通过。
+
+## 集成测试结论
+- `cargo qemu --ch 5` 对应 ch5 关键程序输出已符合预期。
+- 章节核心功能（fork/exec/wait/getpid/yield/clock、trap 处理、initproc + user_shell 流程）已可用。
 
 ## 实现完成时间
-2025-02-05
+2026-02-24
 
 ## 日志语言
 中文

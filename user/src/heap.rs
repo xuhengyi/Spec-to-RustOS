@@ -7,8 +7,8 @@ use customizable_buddy::{BuddyAllocator, LinkedListBuddy, UsizeBuddy};
 
 /// 初始化全局分配器和内核堆分配器。
 pub fn init() {
-    // 托管空间 16 KiB
-    const MEMORY_SIZE: usize = 16 << 10;
+    // 托管空间 64 KiB（exec 后 format/println 等需更大缓冲区，16KiB 易导致 4KB 分配失败）
+    const MEMORY_SIZE: usize = 64 << 10;
     static mut MEMORY: [u8; MEMORY_SIZE] = [0u8; MEMORY_SIZE];
     unsafe {
         HEAP.init(

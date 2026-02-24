@@ -1,3 +1,6 @@
+extern crate alloc;
+
+use alloc::vec::Vec;
 use bitflags::bitflags;
 use crate::{SyscallId, ClockId, TimeSpec, SignalNo, SignalAction};
 
@@ -257,8 +260,11 @@ pub fn fork() -> isize {
 
 /// 执行程序
 pub fn exec(path: &str) -> isize {
+    let mut c_path = Vec::with_capacity(path.len() + 1);
+    c_path.extend_from_slice(path.as_bytes());
+    c_path.push(0);
     unsafe {
-        native::syscall1(SyscallId::EXECVE, path.as_ptr() as usize)
+        native::syscall1(SyscallId::EXECVE, c_path.as_ptr() as usize)
     }
 }
 
@@ -266,15 +272,7 @@ pub fn exec(path: &str) -> isize {
 /// 
 /// 如果返回 -2，会调用 sched_yield() 并重试
 pub fn wait(exit_code_ptr: *mut i32) -> isize {
-    loop {
-        let ret = unsafe {
-            native::syscall1(SyscallId::WAIT4, exit_code_ptr as usize)
-        };
-        if ret != -2 {
-            return ret;
-        }
-        sched_yield();
-    }
+    waitpid(-1, exit_code_ptr)
 }
 
 /// 等待指定进程退出

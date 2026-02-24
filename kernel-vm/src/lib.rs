@@ -211,6 +211,36 @@ impl<Meta: VmMeta, M: PageManager<Meta>> AddressSpace<Meta, M> {
         Some(ptr)
     }
 
+    /// 释放本地址空间中由 `map()` 分配的物理页，并释放根页表页。
+    /// 用于 exec 等场景在替换地址空间前回收旧空间占用的内核堆。
+    /// `skip_vpn`：若某 area 包含此 VPN，则跳过（用于 portal 等从内核复制的页）。
+    pub fn free_allocated_pages_and_root(&mut self, skip_vpn: Option<VPN<Meta>>) {
+        let mut pte_buf = None;
+        for range in core::mem::take(&mut self.areas) {
+            if let Some(skip) = skip_vpn {
+                if range.start.val() <= skip.val() && skip.val() < range.end.val() {
+                    continue; // 跳过 portal 等外部映射
+                }
+            }
+            let count = range.end.val() - range.start.val();
+            if count == 0 {
+                continue;
+            }
+            let vpn0 = range.start;
+            let mut get_visitor = GetPteVisitor {
+                target: vpn0,
+                result: &mut pte_buf,
+                manager: &self.manager,
+            };
+            let pt = self.root();
+            pt.walk(Pos::new(vpn0, 0), &mut get_visitor);
+            if let Some(pte) = pte_buf.take() {
+                self.manager.deallocate(pte, count);
+            }
+        }
+        self.manager.drop_root();
+    }
+
     /// 将本地址空间的 `areas` 中每个虚拟区间在 `new_addrspace` 中重新分配物理页、拷贝数据并建立同等映射。
     pub fn cloneself(&self, new_addrspace: &mut AddressSpace<Meta, M>) {
         for range in &self.areas {

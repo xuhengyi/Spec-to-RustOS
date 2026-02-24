@@ -30,7 +30,10 @@ pub extern "C" fn main() -> i32 {
                     let pid = fork();
                     if pid == 0 {
                         // child process
-                        if exec(line.as_str()) == -1 {
+                        let mut cmd = String::with_capacity(line.len() + 1);
+                        cmd.push_str(line.as_str());
+                        cmd.push('\0');
+                        if exec(cmd.as_str()) == -1 {
                             println!("Error when executing!");
                             return -4;
                         }

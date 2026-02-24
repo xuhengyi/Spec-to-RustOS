@@ -276,6 +276,15 @@ impl Schedule<ProcId> for ProcManager {
     }
 }
 
+fn alloc_pid_nonzero() -> ProcId {
+    loop {
+        let pid = ProcId::new();
+        if pid.get_usize() != 0 {
+            return pid;
+        }
+    }
+}
+
 fn app_name_at(app_names: *const u8, index: usize) -> Option<&'static str> {
     let mut ptr = app_names;
     for i in 0..=index {
@@ -490,6 +499,9 @@ impl syscall::IO for SyscallContext {
                         #[allow(deprecated)]
                         let c = legacy::console_getchar();
                         if c == usize::MAX {
+                            if n == 0 {
+                                continue;
+                            }
                             break;
                         }
                         unsafe { *ptr.as_ptr().add(n) = c as u8 };
@@ -519,7 +531,7 @@ impl syscall::Process for SyscallContext {
         0
     }
 
-    fn fork(&self, caller: Caller) -> isize {
+    fn fork(&self, _caller: Caller) -> isize {
         let processor = unsafe { PROCESSOR.as_mut().unwrap() };
         let parent = match processor.current() {
             Some(p) => p,
@@ -536,8 +548,9 @@ impl syscall::Process for SyscallContext {
         child_ctx.supervisor = parent.context.context.supervisor;
         child_ctx.interrupt = parent.context.context.interrupt;
         *child_ctx.sp_mut() = parent.context.context.sp();
+        child_ctx.move_next();
 
-        let child_pid = ProcId::new();
+        let child_pid = alloc_pid_nonzero();
         *child_ctx.a_mut(0) = 0;
         let child = Process {
             pid: child_pid,
