@@ -1,0 +1,177 @@
+# ch7 实现日志
+
+## 实现开始时间
+2026-02-24 23:40:00 CST
+
+## 使用的资源
+
+1. ✅ 当前 crate 的 spec
+- `openspec/specs/ch7/spec.md`
+- `openspec/specs/ch7/design.md`
+
+2. ⚠️ 直接依赖的 spec（有使用，原因如下）
+- `openspec/specs/signal/spec.md`
+- `openspec/specs/signal-impl/spec.md`
+- 使用原因：`ch7` 的 signal 依赖 crate `signal` / `signal-impl` 在仓库中是空实现，无法仅靠 `ch7` spec 推断 trait 语义与状态机细节，必须补齐依赖接口与实现。
+
+3. 🔧 集成测试阶段访问并修改的 crate 代码
+- `signal/src/lib.rs`
+- `signal-impl/src/lib.rs`
+- 发现的问题：这两个文件均为空，导致 `ch7` 无法完整集成信号子系统。
+- 解决方案：先实现 `signal` 的接口边界与 `signal-impl` 的状态机，再接入 `ch7`。
+
+4. ❌ 已生成代码（下下策访问，已记录原因）
+- 访问文件：`ch6/src/main.rs`、`ch6/build.rs`
+- 原因：`ch7/src/main.rs` 和 `ch7/build.rs` 初始为空，需要先复用可运行章节骨架再叠加 ch7 信号特性，降低从 0 搭建引导/页表/portal/文件系统/调度链路的风险。
+- 学到内容：
+  - portal + trap 主循环组织方式
+  - `Process` / `PManager` 在本工程中的最小可运行接法
+  - qemu easy-fs 集成路径
+
+5. ⚠️ 额外访问的代码（用于输出/行为验证）
+- `syscall/src/{lib.rs,kernel.rs,user.rs,syscalls.rs}`
+- `signal-defs/src/lib.rs`
+- `task-manage/src/lib.rs`
+- `user/src/lib.rs`
+- `user/src/bin/{sig_simple.rs,sig_simple2.rs,sig_ctrlc.rs,sig_tests.rs,initproc.rs,user_shell.rs}`
+- `xtask/src/{main.rs,user.rs}`
+- 原因：核对 syscall ABI、信号编号/动作结构、调度行为与用户程序预期输出。
+
+## 实现过程（关键动作与调试轨迹）
+
+### 第 1 轮：搭建 ch7 骨架并接入 signal 接口
+
+1. 基础骨架
+- 新增 `ch7/build.rs`（从 `ch6/build.rs` 迁移）
+- 复制 `ch6/src/main.rs` 到 `ch7/src/main.rs` 作为启动骨架
+- portal 汇编符号重命名为 `__ch7_portal_*`
+
+2. `signal` crate 实现（原文件为空）
+- 在 `signal/src/lib.rs` 实现：
+  - `SignalAction/SignalNo/MAX_SIG` 重导出
+  - `SignalResult` 枚举
+  - `Signal` trait（`from_fork/clear/add_signal/set_action/get_action_ref/update_mask/handle_signals/sig_return`）
+
+3. `signal-impl` crate 实现（原文件为空）
+- 在 `signal-impl/src/lib.rs` 实现：
+  - `SignalSet` 位图操作（add/remove/contain/union/difference/find_first_one）
+  - `HandlingSignal::{Frozen, UserSignal(LocalContext)}`
+  - `SignalImpl` 状态机（pending/mask/actions/handling）
+  - 默认动作、`SIGSTOP/SIGCONT` 处理、用户态 handler 上下文改写、`sig_return` 恢复、`from_fork` 语义
+
+4. ch7 主体接入
+- `Process` 增加 `signal: Box<dyn signal::Signal>`
+- `Process::fork` 通过 `signal.from_fork()` 继承
+- `Process::exec` 调用 `signal.clear()`
+- 实现 `impl syscall::Signal for SyscallContext`：
+  - `kill`
+  - `sigaction`
+  - `sigprocmask`
+  - `sigreturn`
+- trap 主循环中，syscall 后追加 `proc.signal.handle_signals(...)`（临时放置点，符合 ch7 spec）
+- `rust_main` 中新增 `syscall::init_signal(&SyscallContext)`
+
+5. 编译验证
+- `cargo check -p signal`
+- `cargo check -p signal-impl`
+- `cargo check -p ch7 --target riscv64gc-unknown-none-elf`
+- 结果：通过（仅 warnings）
+
+### 第 2 轮：首次全量联调，`sig_tests` 卡死在 final_sig_test
+
+1. 触发命令
+- `timeout 420s bash -lc 'printf "...sig_tests..." | cargo qemu --ch 7 > /tmp/ch7_run.log 2>&1'`
+
+2. 现象
+- 基础用例全部通过到 `sig_tests`
+- 日志停在：`Testing final_sig_test`
+- qemu 进程 CPU 持续 100% 占用，不再前进
+
+3. 定位动作
+- 单独跑 `sig_tests`：`/tmp/ch7_sig_tests.log`
+- 在 `kill` syscall 临时埋点（发送方/目标/signum）
+- 结果：`final_sig_test` 只看到子进程的自发 `kill(SIGUSR1)`，看不到父进程后续 `kill(14)` / `kill(SIGKILL)`，说明父进程拿不到调度机会
+- 反汇编 `sig_tests` 的 `func2`：
+  - `rust-objdump -d --start-address=0x14d66 --stop-address=0x14d86 .../sig_tests`
+  - 确认 handler 进入无限循环，属于无阻塞忙循环场景
+
+4. 根因
+- 当前内核是协作式调度；无时钟中断抢占。
+- `final_sig_test` 子进程进入用户 handler 的忙循环后，父进程无法继续执行到后续 `kill`，导致整体卡死。
+
+### 第 3 轮：错误方向尝试（保留记录）
+
+1. 尝试方案
+- 对“自发 kill”加一拍延迟处理（同轮 syscall 后不立刻投递信号）
+
+2. 结果
+- 卡死消失，但 `final_sig_test` 失败：`Kill failed!` / `SOME TESTS FAILED`
+- 根因：子进程因延迟投递而过早退出，父进程发送 `kill(14)` 时目标已不存在
+
+3. 结论
+- 该方案不可用，回退。
+
+### 第 4 轮：最终修复（引入最小抢占 + kill 优先）
+
+1. 在 `ch7/src/main.rs` 加入时钟抢占
+- 启动时启用 `sie::set_stimer()`
+- 每轮执行用户态前调用 `set_timer(time::read64() + TIMER_SLICE_TICKS)`
+- 新增 `SupervisorTimer` trap 分支：
+  - 当前任务让出（`make_current_suspend`）
+  - 同时执行一次 `handle_signals`，若返回 `ProcessKilled` 则直接退出当前任务
+
+2. 在 `signal-impl/src/lib.rs` 调整优先级
+- `handle_signals` 开头增加 `SIGKILL` 优先处理：即使处于 `HandlingSignal::UserSignal` 也能被杀死
+
+3. 回归验证
+- 单测：`sig_tests` 从 `Testing final_sig_test` 正常推进到：
+  - `OK!`
+  - `ALL TESTS PASSED`
+
+### 第 5 轮：全量 [ch7] 用例回归
+
+1. 执行命令
+- `timeout 420s bash -lc 'printf "00hello_world ... sig_tests" | cargo qemu --ch 7 > /tmp/ch7_run.log 2>&1'`
+
+2. 关键输出核对（`/tmp/ch7_run.log`）
+- `forktest2 test passed!`
+- `matrix passed.`
+- `file_test passed!`
+- `cat_filea` 输出 `Hello, world!`
+- `sig_simple` 输出 `user_sig_test succsess`
+- `sig_simple2` 父子流程与输出正常
+- `sig_ctrlc: Done`
+- `sig_tests` 输出 `ALL TESTS PASSED`
+
+3. 结论
+- `cargo qemu --ch 7` 可正确运行用户程序，且关键输出与用例预期一致。
+
+## 本次修改文件
+- `ch7/build.rs`（新增）
+- `ch7/src/main.rs`
+- `signal/src/lib.rs`
+- `signal-impl/src/lib.rs`
+
+## 测试结果
+
+1. 编译
+- `cargo check -p signal` ✅
+- `cargo check -p signal-impl` ✅
+- `cargo check -p ch7 --target riscv64gc-unknown-none-elf` ✅
+
+2. 运行
+- `cargo qemu --ch 7`（脚本化喂入 `[ch7]` 用例）✅
+- 关键输出比对通过（见 `/tmp/ch7_run.log`）
+
+3. 是否一次生成通过
+- 否。
+- 迭代链路：
+  - 第 1 版：能跑到 `sig_tests`，但卡死在 `final_sig_test`
+  - 第 2 版（延迟自发信号）：不再卡死但 `Kill failed` 导致 `SOME TESTS FAILED`
+  - 第 3 版（最终）：加入 timer 抢占 + `SIGKILL` 优先，`sig_tests` 与全量回归通过
+
+## 实现完成时间
+2026-02-25 00:31:26 CST
+
+## 日志语言
+中文
