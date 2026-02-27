@@ -266,9 +266,21 @@ pub fn handle(caller: Caller, id: SyscallId, args: [usize; 6]) -> SyscallResult 
         // Sync mutex syscalls
         SyscallId::SEMOP => {
             if let Some(handler) = SYNC_MUTEX_HANDLER.get() {
-                // 这里需要根据参数判断是 create/up/down，暂时使用 args[1] 作为操作类型
-                // 实际实现可能需要不同的 syscall id
+                SyscallResult::Done(handler.semaphore_down(caller, args[0]))
+            } else {
+                SyscallResult::Unsupported(id)
+            }
+        }
+        SyscallId::SEMGET => {
+            if let Some(handler) = SYNC_MUTEX_HANDLER.get() {
                 SyscallResult::Done(handler.semaphore_create(caller, args[0]))
+            } else {
+                SyscallResult::Unsupported(id)
+            }
+        }
+        SyscallId::SEMCTL => {
+            if let Some(handler) = SYNC_MUTEX_HANDLER.get() {
+                SyscallResult::Done(handler.semaphore_up(caller, args[0]))
             } else {
                 SyscallResult::Unsupported(id)
             }

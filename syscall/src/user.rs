@@ -359,14 +359,14 @@ pub fn waittid(tid: usize) -> isize {
 /// 创建信号量
 pub fn semaphore_create(res_count: usize) -> isize {
     unsafe {
-        native::syscall1(SyscallId::SEMOP, res_count)
+        native::syscall1(SyscallId::SEMGET, res_count)
     }
 }
 
 /// 信号量 V 操作
 pub fn semaphore_up(sem_id: usize) -> isize {
     unsafe {
-        native::syscall1(SyscallId::SEMOP, sem_id)
+        native::syscall1(SyscallId::SEMCTL, sem_id)
     }
 }
 

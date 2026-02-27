@@ -1,0 +1,204 @@
+# ch8 实现日志
+
+## 实现开始时间
+2026-02-25 00:36:00 CST
+
+## 使用的资源
+
+1. ✅ 当前 crate 的 spec
+- `openspec/specs/ch8/spec.md`
+- `openspec/specs/ch8/design.md`
+
+2. ⚠️ 直接依赖 spec（有使用，原因如下）
+- `openspec/specs/syscall/spec.md`
+- `openspec/specs/sync/spec.md`
+- 使用原因：
+  - 需要确认 `Thread/SyncMutex` 系统调用接口语义（尤其是 `waittid` 与阻塞语义）。
+  - 需要确认 `Semaphore/Mutex/Condvar` 在“返回值驱动阻塞/唤醒”模型中的约定。
+
+3. ❌ 已生成代码（下下策访问，已记录原因）
+- 访问文件：`ch7/src/main.rs`、`implementation_logs/ch7_implementation.log`、`implementation_logs/ch6_implementation.log`
+- 原因：`ch8/src/main.rs` 初始为空，必须先复用前章可运行骨架（启动、页表、portal、trap 主循环、文件系统加载链路）再叠加 ch8 线程与同步能力。
+- 学到内容：
+  - `portal + trap` 主循环在本仓库中的可运行组织方式
+  - `ch7` 的信号处理放置点与计时器中断抢占策略
+  - 现有 `easy-fs/virtio` 初始化流程和用户程序加载路径
+- 为什么属于下下策：spec 给了契约边界，但空文件场景下无法仅靠契约高效构建完整引导链路。
+
+4. ⚠️ 额外访问代码（用于接口与期望输出核对）
+- `task-manage/src/lib.rs`（`PThreadManager` 行为）
+- `syscall/src/{kernel.rs,user.rs,syscalls.rs,lib.rs}`（系统调用分发/封装）
+- `user/cases.toml`
+- `user/src/bin/{threads.rs,threads_arg.rs,mpsc_sem.rs,sync_sem.rs,race_adder_mutex_blocking.rs,test_condvar.rs,sig_tests.rs,sig_ctrlc.rs}`
+
+## 实现过程（详细动作与调试）
+
+### 第 1 轮：骨架搭建
+
+1. 创建 ch8 可编译骨架
+- 新增 `ch8/build.rs`（从 `ch7/build.rs` 迁移）
+- 复制 `ch7/src/main.rs` 到 `ch8/src/main.rs`
+
+2. 改造为 ch8 线程模型
+- 调度器从 `PManager<Process, ProcManager>` 切换为 `PThreadManager<Process, Thread, ThreadManager, ProcManager>`。
+- 全局运行态增加 `CURRENT_TID`。
+- 将执行实体从“进程上下文”改为“线程上下文”（`Thread { tid, pid, context }`）。
+
+3. 进程/线程数据结构重构
+- `Process` 增加：
+  - `thread_stacks`（线程栈槽追踪）
+  - `waittid_waiters`（`waittid` 阻塞等待关系）
+  - `semaphores/mutexes/condvars`（进程内同步原语）
+  - `condvar_wait_mutex`（条件变量等待线程关联的 mutex id）
+- 保留并复用 ch7 的：
+  - ELF 装载、fd 表、信号对象、fork/exec 基础流程
+
+4. trap 主循环改造
+- 每次调度到线程后，以线程 `ForeignContext` 进入用户态。
+- syscall 返回新增内部阻塞哨兵 `BLOCKED_RETURN`：
+  - `BLOCKED_RETURN` -> `make_current_blocked()`
+  - 普通返回 -> 写回 `a0` 并 `make_current_suspend()`
+  - `EXIT` -> 线程退出路径
+- 线程退出路径新增：
+  - 唤醒 `waittid` 阻塞线程并写回返回值
+  - 线程栈元数据清理
+
+### 第 2 轮：编译失败修复（sync crate 不是 no_std）
+
+1. 报错
+- 命令：`cargo check -p ch8 --target riscv64gc-unknown-none-elf`
+- 报错：`can't find crate for std`（由 `sync` crate 触发）
+- 根因：仓库中的 `sync` crate 当前为空实现且未声明 `#![no_std]`。
+
+2. 修复
+- 修改 `ch8/Cargo.toml`，移除 `sync` 依赖。
+- 在 `ch8/src/main.rs` 内部提供最小同步实现：
+  - `Semaphore`（计数 + 等待队列）
+  - `MutexBlocking`（阻塞锁 + 等待队列）
+  - `Condvar`（等待队列）
+
+3. 结果
+- `cargo check -p ch8 --target riscv64gc-unknown-none-elf` 通过（仅 warnings）。
+
+### 第 3 轮：首轮全量运行，定位信号量语义错误
+
+1. 运行命令
+- `timeout 480s bash -lc 'printf "...ch8 cases..." | cargo qemu --ch 8 > /tmp/ch8_run.log 2>&1'`
+
+2. 现象
+- 绝大多数程序可运行结束。
+- 但 `sync_sem` 输出顺序异常：
+  - 实际：`Second can work now` 早于 `First work and wakeup Second`
+  - 与代码语义不符（应先由 first 唤醒 second）
+
+3. 定位
+- 检查 `syscall/src/user.rs`：
+  - `semaphore_create/up/down` 全部走 `SyscallId::SEMOP`
+- 检查 `syscall/src/kernel.rs`：
+  - `SEMOP` 被固定映射到 `handler.semaphore_create(...)`
+- 根因：信号量 create/up/down 三类操作未分流，导致“down/up 不阻塞不唤醒”。
+
+4. 修复（跨 crate 必要修复）
+- `syscall/src/user.rs`
+  - `semaphore_create` 改为 `SEMGET`
+  - `semaphore_up` 改为 `SEMCTL`
+  - `semaphore_down` 保持 `SEMOP`
+- `syscall/src/kernel.rs`
+  - `SEMOP -> semaphore_down`
+  - `SEMGET -> semaphore_create`
+  - `SEMCTL -> semaphore_up`
+
+5. 回归验证
+- 重新全量运行（`/tmp/ch8_run2.log`）：
+  - `sync_sem` 输出顺序恢复正确：
+    - `Second want ...`
+    - `First work and wakeup Second`
+    - `Second can work now`
+  - `mpsc_sem passed!`
+  - `test_condvar passed!`
+  - `race_adder_mutex_blocking` 正常结束且未触发 `assert`。
+
+### 第 4 轮：补测 sig_tests（脚本输入细节修正）
+
+1. 问题
+- 前两轮脚本中 `sig_ctrlc` 会读取后续字符，导致下一条 `sig_tests` 被当作键盘输入吞掉。
+
+2. 修复
+- 新脚本在 `sig_ctrlc` 后注入空行（ENTER）再输入 `sig_tests`：
+  - `printf "sig_ctrlc\n\nsig_tests\n..."`
+
+3. 结果（`/tmp/ch8_run3.log`）
+- `sig_tests` 全部通过，关键输出：
+  - `Testing final_sig_test`
+  - `ALL TESTS PASSED`
+
+### 第 5 轮：按新要求重新纳入 sync crate
+
+1. 新目标
+- 用户要求：在 ch8 中使用已实现的 `sync` crate，而不是 ch8 内置的临时同步结构。
+
+2. 重构动作
+- `ch8/Cargo.toml`：重新加入 `sync = { path = \"../sync\" }`。
+- `ch8/src/main.rs`：
+  - 删除临时内置 `Semaphore/MutexBlocking/Condvar` 结构体与实现。
+  - 引入 `sync::{Semaphore, MutexBlocking, Condvar, Mutex}`，并改成 `Arc` 持有：
+    - `semaphores: Vec<Arc<SyncSemaphore>>`
+    - `mutexes: Vec<Option<Arc<dyn SyncMutexTrait>>>`
+    - `condvars: Vec<Arc<SyncCondvar>>`
+  - `syscall::SyncMutex` 实现改为直接调用 `sync` crate API（`down/up/lock/unlock/signal/wait_no_sched`）。
+  - 为避免命名冲突，把 `spin::Mutex` 改别名 `SpinMutex`（文件系统 fd 与 virtio 仍用 spin 锁）。
+
+3. 编译期问题与修复
+- 报错：`sync/src/lib.rs` 中 `riscv::register::sstatus::{clear_sie,set_sie}` 调用需要 `unsafe`。
+- 修复：在 `sync/src/lib.rs` 的 `disable_intr/enable_intr` 中增加 `unsafe` 块。
+
+4. 回归验证
+- 编译：
+  - `cargo check -p ch8 --target riscv64gc-unknown-none-elf` ✅
+- 全量运行：
+  - `timeout 480s ... cargo qemu --ch 8 > /tmp/ch8_sync_final.log` ✅
+  - 关键结果：
+    - `ALL TESTS PASSED`（`sig_tests`）
+    - `mpsc_sem passed!`
+    - `sync_sem passed!` 且顺序正确（先 `First work and wakeup Second` 再 `Second can work now`）
+    - `test_condvar passed!`
+
+## 修改文件
+
+1. `ch8/build.rs`（新增）
+2. `ch8/src/main.rs`（完整实现与调试修复；最终版本改为使用 `sync` crate）
+3. `ch8/Cargo.toml`（先移除后重新加入 `sync` 依赖）
+4. `syscall/src/user.rs`（修复 semaphore syscall id 映射）
+5. `syscall/src/kernel.rs`（修复 semaphore 分发映射）
+6. `sync/src/lib.rs`（补充 `sstatus` unsafe 调用）
+7. `Cargo.lock`（依赖变化导致自动更新）
+
+## 测试结果
+
+1. 编译
+- `cargo check -p ch8 --target riscv64gc-unknown-none-elf` ✅
+
+2. 运行
+- 单次全覆盖回归：`/tmp/ch8_run_final.log` ✅（包含 `[ch8]` 全部用例，`sig_ctrlc` 后显式空行退出）
+- 重新纳入 sync 后全覆盖回归：`/tmp/ch8_sync_final.log` ✅（同样覆盖 `[ch8]` 全部用例）
+- 说明：日志尾部的 `timeout` 仅用于结束停留在 shell 提示符的 qemu 进程，不代表用例失败。
+
+3. 关键输出核对
+- `mpsc_sem passed!`
+- `sync_sem passed!` 且先后顺序符合程序语义
+- `test_condvar passed!`
+- `ALL TESTS PASSED`（来自 `sig_tests`）
+
+4. 是否一次生成通过
+- 否。
+- 迭代轨迹：
+  - 第 1 次：编译失败（`sync` crate 非 no_std）
+  - 第 2 次：运行通过但 `sync_sem` 语义错误
+  - 第 3 次：修复 semaphore 映射后语义正确
+  - 第 4 次：修正脚本输入后确认 `sig_tests` 全通过
+
+## 实现完成时间
+2026-02-25 02:31:00 CST
+
+## 日志语言
+中文
